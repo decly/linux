@@ -644,6 +644,7 @@ void qdisc_watchdog_schedule_range_ns(struct qdisc_watchdog *wd, u64 expires,
 	}
 
 	wd->last_expires = expires;
+	/* ¶¨Ê±Æ÷º¯Êýqdisc_watchdog */
 	hrtimer_start_range_ns(&wd->timer,
 			       ns_to_ktime(expires),
 			       delta_ns,
