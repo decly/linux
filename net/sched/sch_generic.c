@@ -629,14 +629,14 @@ static int noqueue_init(struct Qdisc *qdisc, struct nlattr *opt,
 	/* register_qdisc() assigns a default of noop_enqueue if unset,
 	 * but __dev_queue_xmit() treats noqueue only as such
 	 * if this is NULL - so clear it here. */
-	qdisc->enqueue = NULL;
+	qdisc->enqueue = NULL; /* 不排队, dev_queue_xmit中直接走网卡发送 */
 	return 0;
 }
 
 struct Qdisc_ops noqueue_qdisc_ops __read_mostly = {
 	.id		=	"noqueue",
 	.priv_size	=	0,
-	.init		=	noqueue_init,
+	.init		=	noqueue_init, /* 将enqueue置NULL, dev_queue_xmit中直接走网卡发送 */
 	.enqueue	=	noop_enqueue,
 	.dequeue	=	noop_dequeue,
 	.peek		=	noop_dequeue,

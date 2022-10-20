@@ -4177,6 +4177,7 @@ static int __dev_queue_xmit(struct sk_buff *skb, struct net_device *sb_dev)
 		rc = __dev_xmit_skb(skb, q, dev, txq);
 		goto out;
 	}
+	/* noqueue_qdisc_ops->enqueue == NULL: 不排队, dev_queue_xmit中直接走网卡发送 */
 
 	/* The device has no queue. Common case for software devices:
 	 * loopback, all the sorts of tunnels...

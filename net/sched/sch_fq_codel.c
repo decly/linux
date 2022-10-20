@@ -42,29 +42,47 @@
 struct fq_codel_flow {
 	struct sk_buff	  *head;
 	struct sk_buff	  *tail;
-	struct list_head  flowchain;
-	int		  deficit;
-	struct codel_vars cvars;
+	struct list_head  flowchain;	/* 用于链入fq_codel_sched_data的new_flows或old_flows */
+	int		  deficit;	/* flow的剩余发送额度, 一次轮询可发quantum */
+	struct codel_vars cvars;	/* flow的控制变量 */
 }; /* please try to keep this structure <= 64 bytes */
 
 struct fq_codel_sched_data {
 	struct tcf_proto __rcu *filter_list; /* optional external classifier */
 	struct tcf_block *block;
 	struct fq_codel_flow *flows;	/* Flows table [flows_cnt] */
+					/* 流表, 有flows_cnt个流, 哈希相同的共用同一个flow
+					 * 所以一个flow可能对应多个真实的流
+					 */
 	u32		*backlogs;	/* backlog table [flows_cnt] */
+					/* 每个flows中缓存的数据包长度(Byte) */
 	u32		flows_cnt;	/* number of flows */
+					/* flows的个数, 默认1024个
+					 * tc参数flows可设置
+					 */
 	u32		quantum;	/* psched_mtu(qdisc_dev(sch)); */
-	u32		drop_batch_size;
-	u32		memory_limit;
-	struct codel_params cparams;
-	struct codel_stats cstats;
-	u32		memory_usage;
-	u32		drop_overmemory;
-	u32		drop_overlimit;
-	u32		new_flow_count;
+					/* flow每次的发送配额, 单位是字节, 默认为一个MTU(比如1514)
+					 * tc参数quantum可设置
+					 */
+	u32		drop_batch_size; /* 该qdisc缓存的skb太多(总个数超过sch->limit[10240]个或内存占用超过memory_limit[32MB])
+					  * enqueue时需要挑选缓存最多的flow来丢弃其一半的包,
+					  * 但限制一次最多丢弃drop_batch_size(默认64)个
+					  * tc参数drop_batch可设置
+					  */
+	u32		memory_limit;	/* 一个qdisc限制存储skb使用的内存, 默认32MB
+					 * tc参数memory_limit可设置
+					 */
+	struct codel_params cparams;	/* 算法的参数, 可由tc修改 */
+	struct codel_stats cstats;	/* 算法的一些统计 */
+	u32		memory_usage;	/* 缓存的skb占用总内存 */
+	u32		drop_overmemory; /* 因为内存限制丢弃的包个数 */
+	u32		drop_overlimit;	/* 因为个数限制或内存限制丢弃的包个数 */
+	u32		new_flow_count;	/* 新加入流的累计个数，即累计加到new_flows队列的次数 */
 
 	struct list_head new_flows;	/* list of new flows */
+					/* 保存新加入的flow, RR轮询时优先轮询new_flows */
 	struct list_head old_flows;	/* list of old flows */
+					/* 保存旧的flow, dequeue时RR轮询来发送 */
 };
 
 static unsigned int fq_codel_hash(const struct fq_codel_sched_data *q,
@@ -88,7 +106,7 @@ static unsigned int fq_codel_classify(struct sk_buff *skb, struct Qdisc *sch,
 
 	filter = rcu_dereference_bh(q->filter_list);
 	if (!filter)
-		return fq_codel_hash(q, skb) + 1;
+		return fq_codel_hash(q, skb) + 1; /* 使用skb的hash值 */
 
 	*qerr = NET_XMIT_SUCCESS | __NET_XMIT_BYPASS;
 	result = tcf_classify(skb, NULL, filter, &res, false);
@@ -151,6 +169,7 @@ static unsigned int fq_codel_drop(struct Qdisc *sch, unsigned int max_packets,
 	 * In stress mode, we'll try to drop 64 packets from the flow,
 	 * amortizing this linear lookup to one cache line per drop.
 	 */
+	/* 线性遍历找到最大backlogs的idx */
 	for (i = 0; i < q->flows_cnt; i++) {
 		if (q->backlogs[i] > maxbacklog) {
 			maxbacklog = q->backlogs[i];
@@ -159,8 +178,9 @@ static unsigned int fq_codel_drop(struct Qdisc *sch, unsigned int max_packets,
 	}
 
 	/* Our goal is to drop half of this fat flow backlog */
-	threshold = maxbacklog >> 1;
+	threshold = maxbacklog >> 1; /* 丢弃流中一半的skb */
 
+	/* 这里从流的首部开始丢弃一半的skb, 最多丢弃max_packets个(默认64) */
 	flow = &q->flows[idx];
 	len = 0;
 	i = 0;
@@ -191,7 +211,7 @@ static int fq_codel_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 	unsigned int pkt_len;
 	bool memory_limited;
 
-	idx = fq_codel_classify(skb, sch, &ret);
+	idx = fq_codel_classify(skb, sch, &ret); /* 获取流的哈希值索引 */
 	if (idx == 0) {
 		if (ret & __NET_XMIT_BYPASS)
 			qdisc_qstats_drop(sch);
@@ -200,12 +220,13 @@ static int fq_codel_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 	}
 	idx--;
 
-	codel_set_enqueue_time(skb);
-	flow = &q->flows[idx];
-	flow_queue_add(flow, skb);
-	q->backlogs[idx] += qdisc_pkt_len(skb);
+	codel_set_enqueue_time(skb);	/* 设置时间戳 */
+	flow = &q->flows[idx];		/* 索引对应flow */
+	flow_queue_add(flow, skb);	/* 将skb加到flow队列中 */
+	q->backlogs[idx] += qdisc_pkt_len(skb); /* 增加对应索引的backlogs计数 */
 	qdisc_qstats_backlog_inc(sch, skb);
 
+	/* 该flow刚开始发包(或中断后继续), 则加入new_flows */
 	if (list_empty(&flow->flowchain)) {
 		list_add_tail(&flow->flowchain, &q->new_flows);
 		q->new_flow_count++;
@@ -213,9 +234,12 @@ static int fq_codel_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 	}
 	get_codel_cb(skb)->mem_usage = skb->truesize;
 	q->memory_usage += get_codel_cb(skb)->mem_usage;
-	memory_limited = q->memory_usage > q->memory_limit;
+	memory_limited = q->memory_usage > q->memory_limit; /* 是否超过内存限制 */
+	/* skb个数和占用内存没超过限制, 直接返回成功 */
 	if (++sch->q.qlen <= sch->limit && !memory_limited)
 		return NET_XMIT_SUCCESS;
+
+	/* 到这里说明缓存的skb太多了, 需要丢弃 */
 
 	prev_backlog = sch->qstats.backlog;
 	prev_qlen = sch->q.qlen;
@@ -227,9 +251,12 @@ static int fq_codel_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 	 * So instead of dropping a single packet, drop half of its backlog
 	 * with a 64 packets limit to not add a too big cpu spike here.
 	 */
+	/* fq_codel_drop()需要线性遍历所有flow有一定的性能开销, 所以一次执行选择
+	 * 缓存最多的flow直接从队首开始丢弃一半的包, 但限制最多64个
+	 */
 	ret = fq_codel_drop(sch, q->drop_batch_size, to_free);
 
-	prev_qlen -= sch->q.qlen;
+	prev_qlen -= sch->q.qlen; /* 差值即为丢弃的包个数 */
 	prev_backlog -= sch->qstats.backlog;
 	q->drop_overlimit += prev_qlen;
 	if (memory_limited)
@@ -239,19 +266,23 @@ static int fq_codel_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 	 * If we dropped a packet for this flow, return NET_XMIT_CN,
 	 * but in this case, our parents wont increase their backlogs.
 	 */
+	/* ret为挑选丢包的flow索引, 如果恰好是当前的enqueue的flow,
+	 * 那么返回本地拥塞告知上层
+	 */
 	if (ret == idx) {
 		qdisc_tree_reduce_backlog(sch, prev_qlen - 1,
 					  prev_backlog - pkt_len);
 		return NET_XMIT_CN;
 	}
 	qdisc_tree_reduce_backlog(sch, prev_qlen, prev_backlog);
-	return NET_XMIT_SUCCESS;
+	return NET_XMIT_SUCCESS; /* 本enqueue的skb不影响, 所以还是返回成功 */
 }
 
 /* This is the specific function called from codel_dequeue()
  * to dequeue a packet from queue. Note: backlog is handled in
  * codel, we dont need to reduce it here.
  */
+/* 从flow中获取首个skb, 并减去相应统计 */
 static struct sk_buff *dequeue_func(struct codel_vars *vars, void *ctx)
 {
 	struct Qdisc *sch = ctx;
@@ -286,34 +317,40 @@ static struct sk_buff *fq_codel_dequeue(struct Qdisc *sch)
 	struct list_head *head;
 
 begin:
-	head = &q->new_flows;
+	head = &q->new_flows; /* 优先发送new_flows */
 	if (list_empty(head)) {
-		head = &q->old_flows;
+		head = &q->old_flows; /* 然后才是old_flows */
 		if (list_empty(head))
 			return NULL;
 	}
 	flow = list_first_entry(head, struct fq_codel_flow, flowchain);
 
+	/* 发送额度用完了, 添加额度后移到old_flows的尾部 */
 	if (flow->deficit <= 0) {
 		flow->deficit += q->quantum;
 		list_move_tail(&flow->flowchain, &q->old_flows);
 		goto begin;
 	}
 
+	/* dequeue核心函数 */
 	skb = codel_dequeue(sch, &sch->qstats.backlog, &q->cparams,
 			    &flow->cvars, &q->cstats, qdisc_pkt_len,
 			    codel_get_enqueue_time, drop_func, dequeue_func);
 
 	if (!skb) {
 		/* force a pass through old_flows to prevent starvation */
+		/* 如果是新流但是数据包为空并且旧流队列不为空,
+		 * 那么强制加入旧流队列尾部, 防止频繁加入新流队列导致旧流饿死
+		 */
 		if ((head == &q->new_flows) && !list_empty(&q->old_flows))
 			list_move_tail(&flow->flowchain, &q->old_flows);
 		else
+			/* 从队列中删除, 等待enqueue时会再重新加入新流队列 */
 			list_del_init(&flow->flowchain);
 		goto begin;
 	}
 	qdisc_bstats_update(sch, skb);
-	flow->deficit -= qdisc_pkt_len(skb);
+	flow->deficit -= qdisc_pkt_len(skb); /* 减去发送额度 */
 	/* We cant call qdisc_tree_reduce_backlog() if our qlen is 0,
 	 * or HTB crashes. Defer it for next round.
 	 */
