@@ -182,8 +182,12 @@ static int tcp_bpf_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
 		return inet_recv_error(sk, msg, len, addr_len);
 
 	psock = sk_psock_get(sk);
-	if (unlikely(!psock))
+	if (unlikely(!psock)) /* 无psock直接调用tcp_recvmsg */
 		return tcp_recvmsg(sk, msg, len, nonblock, flags, addr_len);
+
+	/* 如果sk接收队列sk_receive_queue有数据但psock的接收队列ingress_msg为空
+	 * 那么调用tcp_recvmsg来接收sk_receive_queue.
+	 */
 	if (!skb_queue_empty(&sk->sk_receive_queue) &&
 	    sk_psock_queue_empty(psock)) {
 		sk_psock_put(sk, psock);
@@ -191,18 +195,21 @@ static int tcp_bpf_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
 	}
 	lock_sock(sk);
 msg_bytes_ready:
+	/* 从psock->ingress_msg获取数据接收到msg */
 	copied = sk_msg_recvmsg(sk, psock, msg, len, flags);
 	if (!copied) {
 		long timeo;
 		int data;
 
 		timeo = sock_rcvtimeo(sk, nonblock);
-		data = tcp_msg_wait_data(sk, psock, timeo);
+		data = tcp_msg_wait_data(sk, psock, timeo); /* 阻塞的话就等待数据 */
 		if (data) {
+			/* psock->ingress_msg接收队列非空则继续接收 */
 			if (!sk_psock_queue_empty(psock))
 				goto msg_bytes_ready;
 			release_sock(sk);
 			sk_psock_put(sk, psock);
+			/* 否则由tcp_recvmsg来接收sk_receive_queue */
 			return tcp_recvmsg(sk, msg, len, nonblock, flags, addr_len);
 		}
 		copied = -EAGAIN;
@@ -520,7 +527,7 @@ int tcp_bpf_update_proto(struct sock *sk, struct sk_psock *psock, bool restore)
 	int family = sk->sk_family == AF_INET6 ? TCP_BPF_IPV6 : TCP_BPF_IPV4;
 	int config = psock->progs.msg_parser   ? TCP_BPF_TX   : TCP_BPF_BASE;
 
-	if (restore) {
+	if (restore) { /* 置1为恢复还原 */
 		if (inet_csk_has_ulp(sk)) {
 			/* TLS does not have an unhash proto in SW cases,
 			 * but we need to ensure we stop using the sock_map
@@ -532,7 +539,7 @@ int tcp_bpf_update_proto(struct sock *sk, struct sk_psock *psock, bool restore)
 		} else {
 			sk->sk_write_space = psock->saved_write_space;
 			/* Pairs with lockless read in sk_clone_lock() */
-			WRITE_ONCE(sk->sk_prot, psock->sk_proto);
+			WRITE_ONCE(sk->sk_prot, psock->sk_proto); /* 将协议还原为tcp_prot */
 		}
 		return 0;
 	}
@@ -548,6 +555,9 @@ int tcp_bpf_update_proto(struct sock *sk, struct sk_psock *psock, bool restore)
 	}
 
 	/* Pairs with lockless read in sk_clone_lock() */
+	/* 将sk的协议替换成tcp_bpf_prots[family][config]
+	 * tcp_bpf_prots更改了tcp_prot的几个函数, 见tcp_bpf_rebuild_protos()
+	 */
 	WRITE_ONCE(sk->sk_prot, &tcp_bpf_prots[family][config]);
 	return 0;
 }

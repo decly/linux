@@ -15,9 +15,9 @@
 #include <net/udp.h>
 
 struct bpf_stab {
-	struct bpf_map map;
-	struct sock **sks;
-	struct sk_psock_progs progs;
+	struct bpf_map map;	/* map核心结构 */
+	struct sock **sks;	/* 保存sockmap中的sock数组, 索引为map的key, 值为value的sock地址 */
+	struct sk_psock_progs progs; /* 保存attach的prog程序, 即bpf_prog_attach()的prog */
 	raw_spinlock_t lock;
 };
 
@@ -48,6 +48,7 @@ static struct bpf_map *sock_map_alloc(union bpf_attr *attr)
 	bpf_map_init_from_attr(&stab->map, attr);
 	raw_spin_lock_init(&stab->lock);
 
+	/* 分配sock指针数组 */
 	stab->sks = bpf_map_area_alloc((u64) stab->map.max_entries *
 				       sizeof(struct sock *),
 				       stab->map.numa_node);
@@ -61,7 +62,7 @@ static struct bpf_map *sock_map_alloc(union bpf_attr *attr)
 
 int sock_map_get_from_fd(const union bpf_attr *attr, struct bpf_prog *prog)
 {
-	u32 ufd = attr->target_fd;
+	u32 ufd = attr->target_fd; /* target_fd是sockmap的fd */
 	struct bpf_map *map;
 	struct fd f;
 	int ret;
@@ -70,9 +71,10 @@ int sock_map_get_from_fd(const union bpf_attr *attr, struct bpf_prog *prog)
 		return -EINVAL;
 
 	f = fdget(ufd);
-	map = __bpf_map_get(f);
+	map = __bpf_map_get(f); /* 获取sockmap */
 	if (IS_ERR(map))
 		return PTR_ERR(map);
+	/* 将要attach的prog保存到sockmap中 */
 	ret = sock_map_prog_update(map, prog, NULL, attr->attach_type);
 	fdput(f);
 	return ret;
@@ -133,10 +135,10 @@ static void sock_map_add_link(struct sk_psock *psock,
 			      struct sk_psock_link *link,
 			      struct bpf_map *map, void *link_raw)
 {
-	link->link_raw = link_raw;
+	link->link_raw = link_raw; /* sock在bpf_stab->sks数组中的地址 */
 	link->map = map;
 	spin_lock_bh(&psock->link_lock);
-	list_add_tail(&link->list, &psock->link);
+	list_add_tail(&link->list, &psock->link); /* 加到psock->link */
 	spin_unlock_bh(&psock->link_lock);
 }
 
@@ -148,7 +150,7 @@ static void sock_map_del_link(struct sock *sk,
 
 	spin_lock_bh(&psock->link_lock);
 	list_for_each_entry_safe(link, tmp, &psock->link, list) {
-		if (link->link_raw == link_raw) {
+		if (link->link_raw == link_raw) { /* link_raw为sockmap中存储sk的地址, 地址一样则表示同一个 */
 			struct bpf_map *map = link->map;
 			struct bpf_stab *stab = container_of(map, struct bpf_stab,
 							     map);
@@ -158,7 +160,7 @@ static void sock_map_del_link(struct sock *sk,
 				verdict_stop = true;
 			if (psock->saved_data_ready && stab->progs.skb_verdict)
 				verdict_stop = true;
-			list_del(&link->list);
+			list_del(&link->list); /* 将link从psock->link中删除 */
 			sk_psock_free_link(link);
 		}
 	}
@@ -166,7 +168,7 @@ static void sock_map_del_link(struct sock *sk,
 	if (strp_stop || verdict_stop) {
 		write_lock_bh(&sk->sk_callback_lock);
 		if (strp_stop)
-			sk_psock_stop_strp(sk, psock);
+			sk_psock_stop_strp(sk, psock); /* 恢复sk->sk_data_ready, 停止strparser */
 		else
 			sk_psock_stop_verdict(sk, psock);
 		write_unlock_bh(&sk->sk_callback_lock);
@@ -183,11 +185,14 @@ static void sock_map_unref(struct sock *sk, void *link_raw)
 	}
 }
 
+/* 修改sock的协议sk->sk_prot
+ * 比如tcp调用了tcp_bpf_update_proto() 将tcp_prot换成了tcp_bpf_prots[family][config]
+ */
 static int sock_map_init_proto(struct sock *sk, struct sk_psock *psock)
 {
 	if (!sk->sk_prot->psock_update_sk_prot)
 		return -EINVAL;
-	psock->psock_update_sk_prot = sk->sk_prot->psock_update_sk_prot;
+	psock->psock_update_sk_prot = sk->sk_prot->psock_update_sk_prot; /* 保存, 恢复时调用 */
 	return sk->sk_prot->psock_update_sk_prot(sk, psock, false);
 }
 
@@ -196,7 +201,7 @@ static struct sk_psock *sock_map_psock_get_checked(struct sock *sk)
 	struct sk_psock *psock;
 
 	rcu_read_lock();
-	psock = sk_psock(sk);
+	psock = sk_psock(sk); /* 即sk->sk_user_data & ~0x3 */
 	if (psock) {
 		if (sk->sk_prot->close != sock_map_close) {
 			psock = ERR_PTR(-EBUSY);
@@ -213,7 +218,7 @@ out:
 
 static int sock_map_link(struct bpf_map *map, struct sock *sk)
 {
-	struct sk_psock_progs *progs = sock_map_progs(map);
+	struct sk_psock_progs *progs = sock_map_progs(map); /* 获取attach到该sockmap上的progs */
 	struct bpf_prog *stream_verdict = NULL;
 	struct bpf_prog *stream_parser = NULL;
 	struct bpf_prog *skb_verdict = NULL;
@@ -255,6 +260,7 @@ static int sock_map_link(struct bpf_map *map, struct sock *sk)
 		}
 	}
 
+	/* 如果sk中已经有psock(比如一个sock可以加入到多个sockmap中但是prog不能重复?) */
 	psock = sock_map_psock_get_checked(sk);
 	if (IS_ERR(psock)) {
 		ret = PTR_ERR(psock);
@@ -262,6 +268,7 @@ static int sock_map_link(struct bpf_map *map, struct sock *sk)
 	}
 
 	if (psock) {
+		/* 检查psock中是否已经有重复prog */
 		if ((msg_parser && READ_ONCE(psock->progs.msg_parser)) ||
 		    (stream_parser  && READ_ONCE(psock->progs.stream_parser)) ||
 		    (skb_verdict && READ_ONCE(psock->progs.skb_verdict)) ||
@@ -272,7 +279,7 @@ static int sock_map_link(struct bpf_map *map, struct sock *sk)
 			ret = -EBUSY;
 			goto out_progs;
 		}
-	} else {
+	} else { /* 分配一个psock并初始化后保存在sk->sk_user_data */
 		psock = sk_psock_init(sk, map->numa_node);
 		if (IS_ERR(psock)) {
 			ret = PTR_ERR(psock);
@@ -283,18 +290,21 @@ static int sock_map_link(struct bpf_map *map, struct sock *sk)
 	if (msg_parser)
 		psock_set_prog(&psock->progs.msg_parser, msg_parser);
 
+	/* 这里修改sock的协议sk->sk_prot
+	 * 比如tcp调用了tcp_bpf_update_proto()将tcp_prot换成了tcp_bpf_prots[family][config]
+	 */
 	ret = sock_map_init_proto(sk, psock);
 	if (ret < 0)
 		goto out_drop;
 
 	write_lock_bh(&sk->sk_callback_lock);
 	if (stream_parser && stream_verdict && !psock->saved_data_ready) {
-		ret = sk_psock_init_strp(sk, psock);
+		ret = sk_psock_init_strp(sk, psock); /* 初始化strparser */
 		if (ret)
 			goto out_unlock_drop;
 		psock_set_prog(&psock->progs.stream_verdict, stream_verdict);
 		psock_set_prog(&psock->progs.stream_parser, stream_parser);
-		sk_psock_start_strp(sk, psock);
+		sk_psock_start_strp(sk, psock); /* 这里替换了sk->sk_data_ready和sk->sk_write_space */
 	} else if (!stream_parser && stream_verdict && !psock->saved_data_ready) {
 		psock_set_prog(&psock->progs.stream_verdict, stream_verdict);
 		sk_psock_start_verdict(sk,psock);
@@ -367,7 +377,7 @@ static struct sock *__sock_map_lookup_elem(struct bpf_map *map, u32 key)
 
 	if (unlikely(key >= map->max_entries))
 		return NULL;
-	return READ_ONCE(stab->sks[key]);
+	return READ_ONCE(stab->sks[key]); /* key为索引 */
 }
 
 static void *sock_map_lookup(struct bpf_map *map, void *key)
@@ -468,11 +478,11 @@ static int sock_map_update_common(struct bpf_map *map, u32 idx,
 	if (unlikely(idx >= map->max_entries))
 		return -E2BIG;
 
-	link = sk_psock_init_link();
+	link = sk_psock_init_link(); /* 分配sk_psock_link */
 	if (!link)
 		return -ENOMEM;
 
-	ret = sock_map_link(map, sk);
+	ret = sock_map_link(map, sk); /* 核心函数, 分配psock启动strparser等 */
 	if (ret < 0)
 		goto out_free;
 
@@ -489,8 +499,8 @@ static int sock_map_update_common(struct bpf_map *map, u32 idx,
 		goto out_unlock;
 	}
 
-	sock_map_add_link(psock, link, map, &stab->sks[idx]);
-	stab->sks[idx] = sk;
+	sock_map_add_link(psock, link, map, &stab->sks[idx]); /* 将link添加到psock->link中 */
+	stab->sks[idx] = sk; /* 更新sock项 */
 	if (osk)
 		sock_map_unref(osk, &stab->sks[idx]);
 	raw_spin_unlock_bh(&stab->lock);
@@ -540,6 +550,11 @@ static bool sock_map_sk_state_allowed(const struct sock *sk)
 static int sock_hash_update_common(struct bpf_map *map, void *key,
 				   struct sock *sk, u64 flags);
 
+/* sockmap和sockhash的update操作
+ * 和sock_hash_ops->map_update_elem (即sock_map_update_elem)是一样的逻辑,
+ * 只是这是由系统调用调用, value为sock的fd,
+ * 而map_update_elem成员直接内核ebpf程序调用, value为sock
+ */
 int sock_map_update_elem_sys(struct bpf_map *map, void *key, void *value,
 			     u64 flags)
 {
@@ -555,7 +570,7 @@ int sock_map_update_elem_sys(struct bpf_map *map, void *key, void *value,
 	if (ufd > S32_MAX)
 		return -EINVAL;
 
-	sock = sockfd_lookup(ufd, &ret);
+	sock = sockfd_lookup(ufd, &ret); /* 根据fd获取socket */
 	if (!sock)
 		return ret;
 	sk = sock->sk;
@@ -563,6 +578,9 @@ int sock_map_update_elem_sys(struct bpf_map *map, void *key, void *value,
 		ret = -EINVAL;
 		goto out;
 	}
+
+	/* 上面通过fd获取到sock后, 下面操作就和sock_map_update_elem()一样了 */
+
 	if (!sock_map_sk_is_suitable(sk)) {
 		ret = -EOPNOTSUPP;
 		goto out;
@@ -572,7 +590,7 @@ int sock_map_update_elem_sys(struct bpf_map *map, void *key, void *value,
 	if (!sock_map_sk_state_allowed(sk))
 		ret = -EOPNOTSUPP;
 	else if (map->map_type == BPF_MAP_TYPE_SOCKMAP)
-		ret = sock_map_update_common(map, *(u32 *)key, sk, flags);
+		ret = sock_map_update_common(map, *(u32 *)key, sk, flags); /* sockmap调用 */
 	else
 		ret = sock_hash_update_common(map, key, sk, flags);
 	sock_map_sk_release(sk);
@@ -634,13 +652,15 @@ BPF_CALL_4(bpf_sk_redirect_map, struct sk_buff *, skb,
 {
 	struct sock *sk;
 
+	/* flags只能为0或BPF_F_INGRESS, 否则丢弃 */
 	if (unlikely(flags & ~(BPF_F_INGRESS)))
 		return SK_DROP;
 
-	sk = __sock_map_lookup_elem(map, key);
+	sk = __sock_map_lookup_elem(map, key); /* 根据key获取sockmap中的sock */
 	if (unlikely(!sk || !sock_map_redirect_allowed(sk)))
 		return SK_DROP;
 
+	/* 把sock和BPF_F_INGRESS标志保存在skb->_sk_redir中 */
 	skb_bpf_set_redir(skb, sk, flags & BPF_F_INGRESS);
 	return SK_PASS;
 }
@@ -790,7 +810,7 @@ static const struct bpf_iter_seq_info sock_map_iter_seq_info = {
 };
 
 static int sock_map_btf_id;
-const struct bpf_map_ops sock_map_ops = {
+const struct bpf_map_ops sock_map_ops = { /* sockmap的操作函数 */
 	.map_meta_equal		= bpf_map_meta_equal,
 	.map_alloc		= sock_map_alloc,
 	.map_free		= sock_map_free,
@@ -1447,6 +1467,7 @@ static int sock_map_prog_update(struct bpf_map *map, struct bpf_prog *prog,
 	if (old)
 		return psock_replace_prog(pprog, prog, old);
 
+	/* 将要attach的prog保存到sockmap中 */
 	psock_set_prog(pprog, prog);
 	return 0;
 }

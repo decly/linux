@@ -17,9 +17,9 @@
 #define NR_MSG_FRAG_IDS			(MAX_MSG_FRAGS + 1)
 
 enum __sk_action {
-	__SK_DROP = 0,
-	__SK_PASS,
-	__SK_REDIRECT,
+	__SK_DROP = 0,	/* 丢弃 */
+	__SK_PASS,	/* 由本sock处理 */
+	__SK_REDIRECT,	/* 重定向到其他sock处理  */
 	__SK_NONE,
 };
 
@@ -55,10 +55,12 @@ struct sk_msg {
 };
 
 struct sk_psock_progs {
-	struct bpf_prog			*msg_parser;
-	struct bpf_prog			*stream_parser;
-	struct bpf_prog			*stream_verdict;
-	struct bpf_prog			*skb_verdict;
+	struct bpf_prog			*msg_parser;     /* 对应BPF_SK_MSG_VERDICT */
+	struct bpf_prog			*stream_parser;  /* 对应BPF_SK_SKB_STREAM_PARSER
+							  * 替换sk->sk_data_ready
+							  */
+	struct bpf_prog			*stream_verdict; /* 对应BPF_SK_SKB_STREAM_VERDICT */
+	struct bpf_prog			*skb_verdict;	 /* 对应BPF_SK_SKB_VERDICT */
 };
 
 enum sk_psock_state_bits {
@@ -77,7 +79,7 @@ struct sk_psock_work_state {
 	u32				off;
 };
 
-struct sk_psock {
+struct sk_psock { /* 保存在sk->sk_user_data中 */
 	struct sock			*sk;
 	struct sock			*sk_redir;
 	u32				apply_bytes;
@@ -86,25 +88,42 @@ struct sk_psock {
 	struct sk_msg			*cork;
 	struct sk_psock_progs		progs;
 #if IS_ENABLED(CONFIG_BPF_STREAM_PARSER)
-	struct strparser		strp;
+	struct strparser		strp;		/* strparser结构 */
 #endif
-	struct sk_buff_head		ingress_skb;
-	struct list_head		ingress_msg;
+	struct sk_buff_head		ingress_skb;	/* skb后备队列, 被其他sock重定向到本sock的skb会被加到这里
+							 * (如果有其他sock重定向过来, 那么为了确保不乱序,
+							 *  本sock不需要重定向的数据也会先加到这里),
+							 * 然后工作队列work调用函数sk_psock_backlog()来循环处理该队列,
+							 * 接收的话则加入到ingress_msg队列,
+							 * 发送的话则调用sendmsg发送出去
+							 */
+	struct list_head		ingress_msg;	/* 本sock接收队列, 唤醒应用层后由tcp_bpf_recvmsg()来接收数据 */
 	spinlock_t			ingress_lock;
 	unsigned long			state;
-	struct list_head		link;
+	struct list_head		link;		/* sk_psock_link链表 */
 	spinlock_t			link_lock;
 	refcount_t			refcnt;
+	/* 以下save_xxx分别保存对应原协议的函数, 比如tcp_port->unhash等 */
 	void (*saved_unhash)(struct sock *sk);
 	void (*saved_close)(struct sock *sk, long timeout);
-	void (*saved_write_space)(struct sock *sk);
-	void (*saved_data_ready)(struct sock *sk);
+	void (*saved_write_space)(struct sock *sk); /* 保存原始的sk->sk_write_space
+						     * 使用strparser的话在sk_psock_start_strp()中会被替换成sk_psock_write_space()
+						     */
+	void (*saved_data_ready)(struct sock *sk); /* 保存原始的sk->sk_data_ready,
+						    * 使用strparser的话在sk_psock_start_strp()中会被替换成sk_psock_strp_data_ready()
+						    */
+	/* 修改协议的函数, 比如tcp_bpf_update_proto()会替换掉tcp_prot
+	 * 这里保存这个函数是为了恢复还原时调用
+	 */
 	int  (*psock_update_sk_prot)(struct sock *sk, struct sk_psock *psock,
 				     bool restore);
-	struct proto			*sk_proto;
+	struct proto			*sk_proto;	/* 保存sk的协议, 因为psock会替换sk的协议
+							 * 比如tcp将tcp_prot换成了tcp_bpf_prots[family][config]
+							 * 见tcp_bpf_update_proto()
+							 */
 	struct mutex			work_mutex;
-	struct sk_psock_work_state	work_state;
-	struct work_struct		work;
+	struct sk_psock_work_state	work_state;	/* 记录工作队列work没处理的状态, 下次继续处理 */
+	struct work_struct		work;		/* 工作队列处理skb的接收和转发, 函数为sk_psock_backlog */
 	struct rcu_work			rwork;
 };
 
@@ -437,6 +456,7 @@ static inline void sk_psock_cork_free(struct sk_psock *psock)
 static inline void sk_psock_restore_proto(struct sock *sk,
 					  struct sk_psock *psock)
 {
+	/* tcp调用比如tcp_bpf_update_proto还原tcp协议 */
 	if (psock->psock_update_sk_prot)
 		psock->psock_update_sk_prot(sk, psock, true);
 }
@@ -536,6 +556,10 @@ static inline struct sock *skb_bpf_redirect_fetch(const struct sk_buff *skb)
 {
 	unsigned long sk_redir = skb->_sk_redir;
 
+	/* bpf程序如果调用bpf_sk_redirect_map(),
+	 * 会把从sockmap得到的sock和BPF_F_INGRESS标志保存在skb->_sk_redir中,
+	 * 所以这里返回的是目的sock
+	 */
 	return (struct sock *)(sk_redir & BPF_F_PTR_MASK);
 }
 
