@@ -1088,20 +1088,21 @@ static void attach_one_default_qdisc(struct net_device *dev,
 				     void *_unused)
 {
 	struct Qdisc *qdisc;
-	const struct Qdisc_ops *ops = default_qdisc_ops;
+	const struct Qdisc_ops *ops = default_qdisc_ops; /* 默认的qdisc算法, 也就是/proc/sys/net/core/default_qdisc */
 
 	if (dev->priv_flags & IFF_NO_QUEUE)
 		ops = &noqueue_qdisc_ops;
 	else if(dev->type == ARPHRD_CAN)
 		ops = &pfifo_fast_ops;
 
+	/* 创建并初始化qdisc, parent为ROOT */
 	qdisc = qdisc_create_dflt(dev_queue, ops, TC_H_ROOT, NULL);
 	if (!qdisc)
 		return;
 
 	if (!netif_is_multiqueue(dev))
 		qdisc->flags |= TCQ_F_ONETXQUEUE | TCQ_F_NOPARENT;
-	dev_queue->qdisc_sleeping = qdisc;
+	dev_queue->qdisc_sleeping = qdisc; /* 设置qdisc */
 }
 
 static void attach_default_qdiscs(struct net_device *dev)
@@ -1111,16 +1112,21 @@ static void attach_default_qdiscs(struct net_device *dev)
 
 	txq = netdev_get_tx_queue(dev, 0);
 
+	/* 网卡只有单个队列 或者 虚拟设备不需要排队规则的(loopback/bonding/vlan等),
+	 * 直接调用attach_one_default_qdisc()设置qdisc
+	 */
 	if (!netif_is_multiqueue(dev) ||
 	    dev->priv_flags & IFF_NO_QUEUE) {
 		netdev_for_each_tx_queue(dev, attach_one_default_qdisc, NULL);
 		dev->qdisc = txq->qdisc_sleeping;
 		qdisc_refcount_inc(dev->qdisc);
-	} else {
-		qdisc = qdisc_create_dflt(txq, &mq_qdisc_ops, TC_H_ROOT, NULL);
+	} else { /* 多网卡队列设置为mq(只是root为mq, 网卡队列还是设置default_qdisc)
+		  * 而dev_queue_xmit发送时也是直接取网卡队列的qdisc
+		  */
+		qdisc = qdisc_create_dflt(txq, &mq_qdisc_ops, TC_H_ROOT, NULL); /* 分配初始化mq */
 		if (qdisc) {
-			dev->qdisc = qdisc;
-			qdisc->ops->attach(qdisc);
+			dev->qdisc = qdisc; /* 设置为mq */
+			qdisc->ops->attach(qdisc); /* 将网卡队列的qdisc算法设置为default_qdisc */
 		}
 	}
 

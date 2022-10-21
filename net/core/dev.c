@@ -3791,6 +3791,9 @@ static inline int __dev_xmit_skb(struct sk_buff *skb, struct Qdisc *q,
 
 	qdisc_calculate_pkt_len(skb, q);
 
+	/* qdisc设置了NOLOCK(比如pfifo)就不需要加qdisc粒度的锁,
+	 * 否则跳过这里下面需要spin_lock互斥各qdisc
+	 */
 	if (q->flags & TCQ_F_NOLOCK) {
 		if (q->flags & TCQ_F_CAN_BYPASS && nolock_qdisc_is_empty(q) &&
 		    qdisc_run_begin(q)) {
@@ -3833,7 +3836,7 @@ no_lock_out:
 	if (unlikely(contended))
 		spin_lock(&q->busylock);
 
-	spin_lock(root_lock);
+	spin_lock(root_lock); /* 加锁 */
 	if (unlikely(test_bit(__QDISC_STATE_DEACTIVATED, &q->state))) {
 		__qdisc_drop(skb, &to_free);
 		rc = NET_XMIT_DROP;
@@ -4169,8 +4172,8 @@ static int __dev_queue_xmit(struct sk_buff *skb, struct net_device *sb_dev)
 	else
 		skb_dst_force(skb);
 
-	txq = netdev_core_pick_tx(dev, skb, sb_dev);
-	q = rcu_dereference_bh(txq->qdisc);
+	txq = netdev_core_pick_tx(dev, skb, sb_dev); /* 选择网卡队列 */
+	q = rcu_dereference_bh(txq->qdisc); /* 获取网卡队列的qdisc */
 
 	trace_net_dev_queue(skb);
 	if (q->enqueue) {
