@@ -240,7 +240,7 @@ int mount_bpffs_for_pin(const char *name)
 		/* nothing to do if already mounted */
 		goto out_free;
 
-	if (block_mount) {
+	if (block_mount) { /* 指定了-n选项, 不会自动mount bpffs */
 		p_err("no BPF file system found, not mounting it due to --nomount option");
 		err = -1;
 		goto out_free;
@@ -666,7 +666,7 @@ static int prog_fd_by_nametag(void *nametag, int **fds, bool tag)
 		struct bpf_prog_info info = {};
 		__u32 len = sizeof(info);
 
-		err = bpf_prog_get_next_id(id, &id);
+		err = bpf_prog_get_next_id(id, &id); /* 从id=0开始遍历所有的prog */
 		if (err) {
 			if (errno != ENOENT) {
 				p_err("%s", strerror(errno));
@@ -689,13 +689,14 @@ static int prog_fd_by_nametag(void *nametag, int **fds, bool tag)
 			goto err_close_fd;
 		}
 
+		/* 比较tag相同或name相同的prog */
 		if ((tag && memcmp(nametag, info.tag, BPF_TAG_SIZE)) ||
 		    (!tag && strncmp(nametag, info.name, BPF_OBJ_NAME_LEN))) {
 			close(fd);
 			continue;
 		}
 
-		if (nb_fds > 0) {
+		if (nb_fds > 0) { /* 不止一个prog重新分配内存 */
 			tmp = realloc(*fds, (nb_fds + 1) * sizeof(int));
 			if (!tmp) {
 				p_err("failed to realloc");
@@ -703,7 +704,7 @@ static int prog_fd_by_nametag(void *nametag, int **fds, bool tag)
 			}
 			*fds = tmp;
 		}
-		(*fds)[nb_fds++] = fd;
+		(*fds)[nb_fds++] = fd; /* name相同的可能有多个, 所以是数组 */
 	}
 
 err_close_fd:
@@ -714,9 +715,10 @@ err_close_fds:
 	return -1;
 }
 
+/* 通过参数查找prog并将fd保存在fds中 */
 int prog_parse_fds(int *argc, char ***argv, int **fds)
 {
-	if (is_prefix(**argv, "id")) {
+	if (is_prefix(**argv, "id")) { /* 通过id可直接找到prog */
 		unsigned int id;
 		char *endptr;
 
@@ -735,7 +737,7 @@ int prog_parse_fds(int *argc, char ***argv, int **fds)
 			return -1;
 		}
 		return 1;
-	} else if (is_prefix(**argv, "tag")) {
+	} else if (is_prefix(**argv, "tag")) { /* 通过tag需要遍历系统所有prog来匹配tag相等的 */
 		unsigned char tag[BPF_TAG_SIZE];
 
 		NEXT_ARGP();
@@ -749,7 +751,7 @@ int prog_parse_fds(int *argc, char ***argv, int **fds)
 		NEXT_ARGP();
 
 		return prog_fd_by_nametag(tag, fds, true);
-	} else if (is_prefix(**argv, "name")) {
+	} else if (is_prefix(**argv, "name")) { /* 通过name需要遍历系统所有prog来匹配name相等的(可能有多个) */
 		char *name;
 
 		NEXT_ARGP();
@@ -762,7 +764,7 @@ int prog_parse_fds(int *argc, char ***argv, int **fds)
 		NEXT_ARGP();
 
 		return prog_fd_by_nametag(name, fds, false);
-	} else if (is_prefix(**argv, "pinned")) {
+	} else if (is_prefix(**argv, "pinned")) { /* 通过pinned路径可直接找到prog */
 		char *path;
 
 		NEXT_ARGP();
@@ -780,6 +782,9 @@ int prog_parse_fds(int *argc, char ***argv, int **fds)
 	return -1;
 }
 
+/* 通过参数查找prog返回fd
+ * PROG := { id PROG_ID | pinned FILE | tag PROG_TAG | name PROG_NAME }
+ */
 int prog_parse_fd(int *argc, char ***argv)
 {
 	int *fds = NULL;
@@ -917,6 +922,9 @@ int map_parse_fds(int *argc, char ***argv, int **fds)
 	return -1;
 }
 
+/* 通过参数查找map返回fd
+ * MAP := { id MAP_ID | pinned FILE | name MAP_NAME }
+ */
 int map_parse_fd(int *argc, char ***argv)
 {
 	int *fds = NULL;
@@ -927,8 +935,8 @@ int map_parse_fd(int *argc, char ***argv)
 		p_err("mem alloc failed");
 		return -1;
 	}
-	nb_fds = map_parse_fds(argc, argv, &fds);
-	if (nb_fds != 1) {
+	nb_fds = map_parse_fds(argc, argv, &fds); /* 查找map返回fd */
+	if (nb_fds != 1) { /* 由于如果使用name查找map可能存在多个, 这里返回错误 */
 		if (nb_fds > 1) {
 			p_err("several maps match this handle");
 			while (nb_fds--)

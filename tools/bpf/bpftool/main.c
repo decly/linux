@@ -114,6 +114,9 @@ static int do_version(int argc, char **argv)
 	return 0;
 }
 
+/* 这个函数不止main中使用, 每个子模块(比如prog)都定义了自己的cmds数组,
+ * 然后通过本函数来执行命令名对应的func
+ */
 int cmd_select(const struct cmd *cmds, int argc, char **argv,
 	       int (*help)(int argc, char **argv))
 {
@@ -123,9 +126,11 @@ int cmd_select(const struct cmd *cmds, int argc, char **argv,
 	last_argv = argv;
 	last_do_help = help;
 
+	/* 没有额外参数默认执行首个命令 */
 	if (argc < 1 && cmds[0].func)
 		return cmds[0].func(argc, argv);
 
+	/* 比较命令名匹配后执行对应的func */
 	for (i = 0; cmds[i].cmd; i++) {
 		if (is_prefix(*argv, cmds[i].cmd)) {
 			if (!cmds[i].func) {
@@ -474,6 +479,7 @@ int main(int argc, char **argv)
 	if (argc < 0)
 		usage();
 
+	/* 这里执行通过命令执行具体操作, 执行的是cmds数组中对应的函数 */
 	ret = cmd_select(cmds, argc, argv, do_help);
 
 	if (json_output)
