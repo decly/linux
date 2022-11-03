@@ -481,13 +481,15 @@ static struct proto tcp_bpf_prots[TCP_BPF_NUM_PROTS][TCP_BPF_NUM_CFGS];
 static void tcp_bpf_rebuild_protos(struct proto prot[TCP_BPF_NUM_CFGS],
 				   struct proto *base)
 {
-	prot[TCP_BPF_BASE]			= *base;
+	/* stream_parser (BPF_PROG_TYPE_SK_SKB)使用, 主要修改接收接口 */
+	prot[TCP_BPF_BASE]			= *base; /* 先复制tcp_prot */
 	prot[TCP_BPF_BASE].unhash		= sock_map_unhash;
 	prot[TCP_BPF_BASE].close		= sock_map_close;
 	prot[TCP_BPF_BASE].recvmsg		= tcp_bpf_recvmsg;
 	prot[TCP_BPF_BASE].sock_is_readable	= sk_msg_is_readable;
 
-	prot[TCP_BPF_TX]			= prot[TCP_BPF_BASE];
+	/* msg_parser (BPF_PROG_TYPE_SK_MSG)使用, 在TCP_BPF_BASE基础上增加修改发送接口 */
+	prot[TCP_BPF_TX]			= prot[TCP_BPF_BASE]; /* 先复制上面的TCP_BPF_BASE */
 	prot[TCP_BPF_TX].sendmsg		= tcp_bpf_sendmsg;
 	prot[TCP_BPF_TX].sendpage		= tcp_bpf_sendpage;
 }

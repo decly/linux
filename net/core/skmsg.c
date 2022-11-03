@@ -1185,6 +1185,7 @@ static int sk_psock_verdict_recv(read_descriptor_t *desc, struct sk_buff *skb,
 		sock_drop(sk, skb);
 		goto out;
 	}
+	/* 获取stream_verdict或skb_verdict prog程序 */
 	prog = READ_ONCE(psock->progs.stream_verdict);
 	if (!prog)
 		prog = READ_ONCE(psock->progs.skb_verdict);
@@ -1192,10 +1193,13 @@ static int sk_psock_verdict_recv(read_descriptor_t *desc, struct sk_buff *skb,
 		skb->sk = sk;
 		skb_dst_drop(skb);
 		skb_bpf_redirect_clear(skb);
+ 		/* 执行我们attach到sockmap的stream_verdict/skb_verdict bpf程序 */
 		ret = bpf_prog_run_pin_on_cpu(prog, skb);
+		/* 将返回值ret转为__sk_action的一种 */
 		ret = sk_psock_map_verd(ret, skb_bpf_redirect_fetch(skb));
 		skb->sk = NULL;
 	}
+	/* 真正处理数据接收或重定向 */
 	if (sk_psock_verdict_apply(psock, skb, ret) < 0)
 		len = 0;
 out:
@@ -1215,6 +1219,9 @@ static void sk_psock_verdict_data_ready(struct sock *sk)
 	desc.error = 0;
 	desc.count = 1;
 
+	/* tcp调用tcp_read_sock()
+	 * 主要就是读取sk_receive_queue中skb, 然后调用sk_psock_verdict_recv()处理
+	 */
 	sock->ops->read_sock(sk, &desc, sk_psock_verdict_recv);
 }
 
@@ -1224,7 +1231,7 @@ void sk_psock_start_verdict(struct sock *sk, struct sk_psock *psock)
 		return;
 
 	psock->saved_data_ready = sk->sk_data_ready;
-	sk->sk_data_ready = sk_psock_verdict_data_ready;
+	sk->sk_data_ready = sk_psock_verdict_data_ready; /* 替换为verdict的核心接收处理函数 */
 	sk->sk_write_space = sk_psock_write_space;
 }
 

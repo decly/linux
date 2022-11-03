@@ -55,12 +55,25 @@ struct sk_msg {
 };
 
 struct sk_psock_progs {
-	struct bpf_prog			*msg_parser;     /* 对应BPF_SK_MSG_VERDICT */
-	struct bpf_prog			*stream_parser;  /* 对应BPF_SK_SKB_STREAM_PARSER
-							  * 替换sk->sk_data_ready
+	struct bpf_prog			*msg_parser;     /* 发送重定向的prog, 作用在sendmsg/sendpage 发送位置的hook,
+							  * prog type: BPF_PROG_TYPE_SK_MSG
+							  * 对应attach type: BPF_SK_MSG_VERDICT
 							  */
-	struct bpf_prog			*stream_verdict; /* 对应BPF_SK_SKB_STREAM_VERDICT */
-	struct bpf_prog			*skb_verdict;	 /* 对应BPF_SK_SKB_VERDICT */
+	struct bpf_prog			*stream_parser;  /* 流接收重定向的解析prog, 替换sk->sk_data_ready, 仅用于TCP
+							  * prog type: BPF_PROG_TYPE_SK_SKB
+							  * 对应attach type: BPF_SK_SKB_STREAM_PARSER
+							  * 注: stream_parser可以不使用, 即不解析直接使用stream_verdict重定向
+							  */
+	struct bpf_prog			*stream_verdict; /* 流接收重定向的重定向prog, 替换sk->sk_data_ready, 仅用于TCP
+							  * prog type: BPF_PROG_TYPE_SK_SKB
+							  * 对应attach type: BPF_SK_SKB_STREAM_VERDICT
+							  * 注: stream_verdict可单独使用
+							  */
+	struct bpf_prog			*skb_verdict;	 /* 通用接收重定向的prog, 替换sk->sk_data_ready
+							  * prog type: BPF_PROG_TYPE_SK_SKB
+							  * 对应attach type: BPF_SK_SKB_VERDICT
+							  * 注: skb_verdict单独使用, 不能和stream_verdict同时使用
+							  */
 };
 
 enum sk_psock_state_bits {

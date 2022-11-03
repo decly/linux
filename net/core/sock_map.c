@@ -14,9 +14,9 @@
 #include <linux/sock_diag.h>
 #include <net/udp.h>
 
-struct bpf_stab {
+struct bpf_stab { /* sockmap分配的结构 */
 	struct bpf_map map;	/* map核心结构 */
-	struct sock **sks;	/* 保存sockmap中的sock数组, 索引为map的key, 值为value的sock地址 */
+	struct sock **sks;	/* 保存sockmap中的sock数组, 索引为map的key, 值为value的sock地址(即struct sock *) */
 	struct sk_psock_progs progs; /* 保存attach的prog程序, 即bpf_prog_attach()的prog */
 	raw_spinlock_t lock;
 };
@@ -62,7 +62,7 @@ static struct bpf_map *sock_map_alloc(union bpf_attr *attr)
 
 int sock_map_get_from_fd(const union bpf_attr *attr, struct bpf_prog *prog)
 {
-	u32 ufd = attr->target_fd; /* target_fd是sockmap的fd */
+	u32 ufd = attr->target_fd; /* target_fd是sockmap/sockhash的fd */
 	struct bpf_map *map;
 	struct fd f;
 	int ret;
@@ -71,10 +71,10 @@ int sock_map_get_from_fd(const union bpf_attr *attr, struct bpf_prog *prog)
 		return -EINVAL;
 
 	f = fdget(ufd);
-	map = __bpf_map_get(f); /* 获取sockmap */
+	map = __bpf_map_get(f); /* 获取sockmap/sockhash */
 	if (IS_ERR(map))
 		return PTR_ERR(map);
-	/* 将要attach的prog保存到sockmap中 */
+	/* 将要attach的prog保存到sockmap/sockhash中 */
 	ret = sock_map_prog_update(map, prog, NULL, attr->attach_type);
 	fdput(f);
 	return ret;
@@ -82,7 +82,7 @@ int sock_map_get_from_fd(const union bpf_attr *attr, struct bpf_prog *prog)
 
 int sock_map_prog_detach(const union bpf_attr *attr, enum bpf_prog_type ptype)
 {
-	u32 ufd = attr->target_fd;
+	u32 ufd = attr->target_fd; /* target_fd是sockmap/sockhash的fd  */
 	struct bpf_prog *prog;
 	struct bpf_map *map;
 	struct fd f;
@@ -92,21 +92,22 @@ int sock_map_prog_detach(const union bpf_attr *attr, enum bpf_prog_type ptype)
 		return -EINVAL;
 
 	f = fdget(ufd);
-	map = __bpf_map_get(f);
+	map = __bpf_map_get(f); /* 获取sockmap/sockhash */
 	if (IS_ERR(map))
 		return PTR_ERR(map);
 
-	prog = bpf_prog_get(attr->attach_bpf_fd);
+	prog = bpf_prog_get(attr->attach_bpf_fd); /* 根据提供的fd获取要detach的prog */
 	if (IS_ERR(prog)) {
 		ret = PTR_ERR(prog);
 		goto put_map;
 	}
 
-	if (prog->type != ptype) {
+	if (prog->type != ptype) { /* prog类型需要匹配 */
 		ret = -EINVAL;
 		goto put_prog;
 	}
 
+	/* 这里将prog从map中删除(置NULL) */
 	ret = sock_map_prog_update(map, NULL, prog, attr->attach_type);
 put_prog:
 	bpf_prog_put(prog);
@@ -268,7 +269,10 @@ static int sock_map_link(struct bpf_map *map, struct sock *sk)
 	}
 
 	if (psock) {
-		/* 检查psock中是否已经有重复prog */
+		/* 检查psock中是否已经有重复prog,
+		 * msg_parser和stream_parser可独立设置
+		 * skb_verdict和stream_verdict只能设置其中一个, 因为这两都是重定向的, 逻辑也是一样的
+		 */
 		if ((msg_parser && READ_ONCE(psock->progs.msg_parser)) ||
 		    (stream_parser  && READ_ONCE(psock->progs.stream_parser)) ||
 		    (skb_verdict && READ_ONCE(psock->progs.skb_verdict)) ||
@@ -287,17 +291,28 @@ static int sock_map_link(struct bpf_map *map, struct sock *sk)
 		}
 	}
 
-	if (msg_parser)
+	/* 设置msg_parser(用于发送重定向)
+	 * 与其他三个stream_parser/stream_verdict/skb_verdict(接收重定向)可独立设置
+	 * 注: msg_parser通过tcp_bpf_prots->sendmsg来触发发送重定向, 不需要和接收重定向
+	 * 一样修改sk_data_ready来触发
+	 */
+	if (msg_parser) /* attach type: BPF_SK_MSG_VERDICT, 对应prog type: BPF_PROG_TYPE_SK_MSG */
 		psock_set_prog(&psock->progs.msg_parser, msg_parser);
 
 	/* 这里修改sock的协议sk->sk_prot
-	 * 比如tcp调用了tcp_bpf_update_proto()将tcp_prot换成了tcp_bpf_prots[family][config]
+	 * 比如tcp调用了tcp_bpf_update_proto()将tcp_prot换成了tcp_bpf_prots[family][config]:
+	 *   BPF_PROG_TYPE_SK_SKB 取代为 tcp_bpf_prots[TCP_BPF_IPV4][TCP_BPF_BASE]
+	 *   BPF_PROG_TYPE_SK_MSG 取代为 tcp_bpf_prots[TCP_BPF_IPV4][TCP_BPF_TX]
 	 */
 	ret = sock_map_init_proto(sk, psock);
 	if (ret < 0)
 		goto out_drop;
 
 	write_lock_bh(&sk->sk_callback_lock);
+	/* 
+	 * 这里检查然后启动接收重定向的3个prog
+	 */
+	/* attach了stream_parser和stream_verdict的话, 使用strparser来处理接收的解析和重定向 */
 	if (stream_parser && stream_verdict && !psock->saved_data_ready) {
 		ret = sk_psock_init_strp(sk, psock); /* 初始化strparser */
 		if (ret)
@@ -305,9 +320,11 @@ static int sock_map_link(struct bpf_map *map, struct sock *sk)
 		psock_set_prog(&psock->progs.stream_verdict, stream_verdict);
 		psock_set_prog(&psock->progs.stream_parser, stream_parser);
 		sk_psock_start_strp(sk, psock); /* 这里替换了sk->sk_data_ready和sk->sk_write_space */
+	/* 只attach了stream_verdict, 只需要处理接收重定向, 不需要借助strparser解析 */
 	} else if (!stream_parser && stream_verdict && !psock->saved_data_ready) {
 		psock_set_prog(&psock->progs.stream_verdict, stream_verdict);
-		sk_psock_start_verdict(sk,psock);
+		sk_psock_start_verdict(sk,psock); /* 重定向替换sk->sk_data_ready和sk->sk_write_space */
+	/* 只attach了skb_verdict, 与只attach了stream_verdict是一样的 */
 	} else if (!stream_verdict && skb_verdict && !psock->saved_data_ready) {
 		psock_set_prog(&psock->progs.skb_verdict, skb_verdict);
 		sk_psock_start_verdict(sk, psock);
@@ -587,11 +604,11 @@ int sock_map_update_elem_sys(struct bpf_map *map, void *key, void *value,
 	}
 
 	sock_map_sk_acquire(sk);
-	if (!sock_map_sk_state_allowed(sk))
+	if (!sock_map_sk_state_allowed(sk)) /* TCP只有ESTABLISHED和LISTEN状态能加到sockmap中 */
 		ret = -EOPNOTSUPP;
 	else if (map->map_type == BPF_MAP_TYPE_SOCKMAP)
 		ret = sock_map_update_common(map, *(u32 *)key, sk, flags); /* sockmap调用 */
-	else
+	else /* sockhash调用 */
 		ret = sock_hash_update_common(map, key, sk, flags);
 	sock_map_sk_release(sk);
 out:
@@ -827,11 +844,11 @@ const struct bpf_map_ops sock_map_ops = { /* sockmap的操作函数 */
 };
 
 struct bpf_shtab_elem {
-	struct rcu_head rcu;
-	u32 hash;
-	struct sock *sk;
-	struct hlist_node node;
-	u8 key[];
+	struct rcu_head rcu;	/* 用于释放时 */
+	u32 hash;		/* 在哈希表中的hash值, 由key计算 */
+	struct sock *sk;	/* value值, 也就是sock */
+	struct hlist_node node;	/* 链入哈希表 */
+	u8 key[];		/* key值 */
 };
 
 struct bpf_shtab_bucket {
@@ -839,13 +856,13 @@ struct bpf_shtab_bucket {
 	raw_spinlock_t lock;
 };
 
-struct bpf_shtab {
-	struct bpf_map map;
-	struct bpf_shtab_bucket *buckets;
-	u32 buckets_num;
-	u32 elem_size;
-	struct sk_psock_progs progs;
-	atomic_t count;
+struct bpf_shtab { /* sockhash map分配的结构 */
+	struct bpf_map map; /* map核心结构 */
+	struct bpf_shtab_bucket *buckets; /* 哈希表, 元素结构体为struct bpf_shtab_elem */
+	u32 buckets_num;  /* 哈希表桶个数, 为max_entries向上取整到2的n次方 */
+	u32 elem_size;	/* 每个元素的大小: struct bpf_shtab_elem大小 + key的大小(对齐到8B) */
+	struct sk_psock_progs progs; /* 保存attach的prog程序, 即bpf_prog_attach()的prog */
+	atomic_t count; /* 当前哈希表中元素的个数 */
 };
 
 static inline u32 sock_hash_bucket_hash(const void *key, u32 len)
@@ -991,7 +1008,7 @@ static int sock_hash_update_common(struct bpf_map *map, void *key,
 	if (!link)
 		return -ENOMEM;
 
-	ret = sock_map_link(map, sk);
+	ret = sock_map_link(map, sk); /* 核心函数, 为sk分配psock, 并设置prog和重定向初始化 */
 	if (ret < 0)
 		goto out_free;
 
@@ -1002,6 +1019,7 @@ static int sock_hash_update_common(struct bpf_map *map, void *key,
 	bucket = sock_hash_select_bucket(htab, hash);
 
 	raw_spin_lock_bh(&bucket->lock);
+	/* 从哈希表中查找是否已经存在sk */
 	elem = sock_hash_lookup_elem_raw(&bucket->head, hash, key, key_size);
 	if (elem && flags == BPF_NOEXIST) {
 		ret = -EEXIST;
@@ -1011,18 +1029,19 @@ static int sock_hash_update_common(struct bpf_map *map, void *key,
 		goto out_unlock;
 	}
 
+	/* 不管是否已经存在都分配一个新的(存在旧的话后面再删除旧的) */
 	elem_new = sock_hash_alloc_elem(htab, key, key_size, hash, sk, elem);
 	if (IS_ERR(elem_new)) {
 		ret = PTR_ERR(elem_new);
 		goto out_unlock;
 	}
 
-	sock_map_add_link(psock, link, map, elem_new);
+	sock_map_add_link(psock, link, map, elem_new); /* 将link添加到psock->link中 */
 	/* Add new element to the head of the list, so that
 	 * concurrent search will find it before old elem.
 	 */
-	hlist_add_head_rcu(&elem_new->node, &bucket->head);
-	if (elem) {
+	hlist_add_head_rcu(&elem_new->node, &bucket->head); /* 加入哈希表的头(优先于旧的) */
+	if (elem) { /* 存在旧的则删除 */
 		hlist_del_rcu(&elem->node);
 		sock_map_unref(elem->sk, elem);
 		sock_hash_free_elem(htab, elem);
@@ -1099,7 +1118,9 @@ static struct bpf_map *sock_hash_alloc(union bpf_attr *attr)
 
 	bpf_map_init_from_attr(&htab->map, attr);
 
+	/* 哈希表桶个数为max_entries向上取整到2的n次方 */
 	htab->buckets_num = roundup_pow_of_two(htab->map.max_entries);
+	/* 每个元素的大小: struct bpf_shtab_elem大小+key的大小(对齐到8B) */
 	htab->elem_size = sizeof(struct bpf_shtab_elem) +
 			  round_up(htab->map.key_size, 8);
 	if (htab->buckets_num == 0 ||
@@ -1108,6 +1129,7 @@ static struct bpf_map *sock_hash_alloc(union bpf_attr *attr)
 		goto free_htab;
 	}
 
+	/* 分配哈希表内存 */
 	htab->buckets = bpf_map_area_alloc(htab->buckets_num *
 					   sizeof(struct bpf_shtab_bucket),
 					   htab->map.numa_node);
@@ -1402,7 +1424,7 @@ static const struct bpf_iter_seq_info sock_hash_iter_seq_info = {
 };
 
 static int sock_hash_map_btf_id;
-const struct bpf_map_ops sock_hash_ops = {
+const struct bpf_map_ops sock_hash_ops = { /* sockhash的操作函数 */
 	.map_meta_equal		= bpf_map_meta_equal,
 	.map_alloc		= sock_hash_alloc,
 	.map_free		= sock_hash_free,
