@@ -1379,7 +1379,7 @@ get_prog_type_by_name(const char *name, enum bpf_prog_type *prog_type,
 	/* 根据section name(即bpf程序中定义的__section字段)确定prog类型和可attach的类型,
 	 * libbpf中定义了section_defs数组, 将prog类型和固定的section name对应起来,
 	 * (固定的section name就是bpftool prog help显示的TYPE那些类型)
-	 * 这样就可以通过section name遍历这个数组来确定prog的类型
+	 * 这样就可以通过section name遍历这个数组来确定prog的类型(只判断前缀一样即可)
 	 */
 	ret = libbpf_prog_type_by_name(name, prog_type, expected_attach_type);
 	if (!ret)
@@ -1652,6 +1652,11 @@ static int load_with_options(int argc, char **argv, bool first_prog_only)
 	if (err)
 		goto err_close_obj;
 
+	/* 指定first_prog_only(prog load)只PIN首个prog, 由于在bpftool执行完后只会保留被PIN的prog,
+	 * 所以相当于只load了首个prog.
+	 * 而不指定first_prog_only(prog loadall)的话把所有prog都PIN到bpffs中,
+	 * 也就相当于load了全部的prog.
+	 */
 	if (first_prog_only) { /* bpftool prog load只PIN首个prog, pinfile为pin文件路径 */
 		prog = bpf_program__next(NULL, obj); /* 首个prog */
 		if (!prog) {

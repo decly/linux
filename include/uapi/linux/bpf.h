@@ -5483,20 +5483,20 @@ enum sk_action {
 /* user accessible metadata for SK_MSG packet hook, new fields must
  * be added to the end of this structure
  */
-struct sk_msg_md {
-	__bpf_md_ptr(void *, data);
-	__bpf_md_ptr(void *, data_end);
+struct sk_msg_md { /* msg_parser prog的上下文参数, 初始化详见sk_msg_convert_ctx_access() */
+	__bpf_md_ptr(void *, data);	/* 即sk_msg->data */
+	__bpf_md_ptr(void *, data_end);	/* 即sk_msg->data_end */
 
-	__u32 family;
-	__u32 remote_ip4;	/* Stored in network byte order */
-	__u32 local_ip4;	/* Stored in network byte order */
-	__u32 remote_ip6[4];	/* Stored in network byte order */
-	__u32 local_ip6[4];	/* Stored in network byte order */
-	__u32 remote_port;	/* Stored in network byte order */
-	__u32 local_port;	/* stored in host byte order */
-	__u32 size;		/* Total size of sk_msg */
+	__u32 family;		/* 即sock_common->skc_family */
+	__u32 remote_ip4;	/* Stored in network byte order *//* 即sock_common->skc_daddr */
+	__u32 local_ip4;	/* Stored in network byte order *//* 即sock_common->skc_rcv_saddr */
+	__u32 remote_ip6[4];	/* Stored in network byte order *//* 即sock_common->skc_v6_daddr */
+	__u32 local_ip6[4];	/* Stored in network byte order *//* 即sock_common->skc_v6_rcv_saddr */
+	__u32 remote_port;	/* Stored in network byte order *//* 即sock_common->skc_dport, 32bit的网络字节序, 需用bpf_ntohl()转换 */
+	__u32 local_port;	/* stored in host byte order */	  /* 即sock_common->skc_num */
+	__u32 size;		/* Total size of sk_msg */	  /* 即sk_msg->sk_msg_sg->size */
 
-	__bpf_md_ptr(struct bpf_sock *, sk); /* current socket */
+	__bpf_md_ptr(struct bpf_sock *, sk); /* current socket */ /* 即sk_msg->sk */
 };
 
 struct sk_reuseport_md {

@@ -432,11 +432,12 @@ static int __sock_map_delete(struct bpf_stab *stab, struct sock *sk_test,
 
 	raw_spin_lock_bh(&stab->lock);
 	sk = *psk;
+	/* 这里将sk从sockmap删除(psk为sockmap中保存sk的地址, 将它置NULL) */
 	if (!sk_test || sk_test == sk)
 		sk = xchg(psk, NULL);
 
 	if (likely(sk))
-		sock_map_unref(sk, psk);
+		sock_map_unref(sk, psk); /* 将sk_psock_link从psock->link删除 */
 	else
 		err = -EINVAL;
 
@@ -697,13 +698,15 @@ BPF_CALL_4(bpf_msg_redirect_map, struct sk_msg *, msg,
 {
 	struct sock *sk;
 
+	/* flags只能为0或BPF_F_INGRESS, 否则丢弃 */
 	if (unlikely(flags & ~(BPF_F_INGRESS)))
 		return SK_DROP;
 
-	sk = __sock_map_lookup_elem(map, key);
+	sk = __sock_map_lookup_elem(map, key); /* 根据key找到sk */
 	if (unlikely(!sk || !sock_map_redirect_allowed(sk)))
 		return SK_DROP;
 
+	/* 把sock和BPF_F_INGRESS标志保存在msg中 */
 	msg->flags = flags;
 	msg->sk_redir = sk;
 	return SK_PASS;
@@ -1260,13 +1263,15 @@ BPF_CALL_4(bpf_sk_redirect_hash, struct sk_buff *, skb,
 {
 	struct sock *sk;
 
+	/* flags只能为0或BPF_F_INGRESS, 否则丢弃 */
 	if (unlikely(flags & ~(BPF_F_INGRESS)))
 		return SK_DROP;
 
-	sk = __sock_hash_lookup_elem(map, key);
+	sk = __sock_hash_lookup_elem(map, key); /* 根据Key从哈希表找到sk */
 	if (unlikely(!sk || !sock_map_redirect_allowed(sk)))
 		return SK_DROP;
 
+	/* 把sock和BPF_F_INGRESS标志保存在skb->_sk_redir中 */
 	skb_bpf_set_redir(skb, sk, flags & BPF_F_INGRESS);
 	return SK_PASS;
 }
@@ -1512,8 +1517,8 @@ static void sock_map_remove_links(struct sock *sk, struct sk_psock *psock)
 {
 	struct sk_psock_link *link;
 
-	while ((link = sk_psock_link_pop(psock))) {
-		sock_map_unlink(sk, link);
+	while ((link = sk_psock_link_pop(psock))) { /* 遍历psock->link */
+		sock_map_unlink(sk, link); /* 将sk从sockmap删除等操作 */
 		sk_psock_free_link(link);
 	}
 }
@@ -1554,7 +1559,7 @@ void sock_map_close(struct sock *sk, long timeout)
 	}
 
 	saved_close = psock->saved_close;
-	sock_map_remove_links(sk, psock);
+	sock_map_remove_links(sk, psock); /* 这里将sk从sockmap/sockhash中删除 */
 	rcu_read_unlock();
 	sk_psock_stop(psock, true);
 	sk_psock_put(sk, psock);

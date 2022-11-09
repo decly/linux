@@ -18,7 +18,7 @@
 
 enum __sk_action {
 	__SK_DROP = 0,	/* 丢弃 */
-	__SK_PASS,	/* 由本sock处理 */
+	__SK_PASS,	/* 不修改 */
 	__SK_REDIRECT,	/* 重定向到其他sock处理  */
 	__SK_NONE,
 };
@@ -45,11 +45,17 @@ struct sk_msg {
 	struct sk_msg_sg		sg;
 	void				*data;
 	void				*data_end;
-	u32				apply_bytes;
-	u32				cork_bytes;
-	u32				flags;
+	u32				apply_bytes;	/* 需要应用同一个重定向结果的字节数,
+							 * 由msg_parser程序中调用bpf_msg_apply_bytes()设置
+							 * 执行msg_parser程序后会赋值给psock->apply_bytes,
+							 */
+	u32				cork_bytes;	/* 需要等待累计cork_bytes字节的数据才调用msg_parser prog
+							 * 由msg_parser程序中调用bpf_msg_cork_bytes()设置,
+							 * 数据量不足cork_bytes则先缓存不会调用msg_parser prog, 也不会对数据进行发送
+							 */
+	u32				flags;		/* 保存重定向BPF_F_INGRESS标志 */
 	struct sk_buff			*skb;
-	struct sock			*sk_redir;
+	struct sock			*sk_redir;	/* 需要重定向到其他的sock, 为NULL表示不修改 */
 	struct sock			*sk;
 	struct list_head		list;
 };
@@ -64,7 +70,7 @@ struct sk_psock_progs {
 							  * 对应attach type: BPF_SK_SKB_STREAM_PARSER
 							  * 注: stream_parser可以不使用, 即不解析直接使用stream_verdict重定向
 							  */
-	struct bpf_prog			*stream_verdict; /* 流接收重定向的重定向prog, 替换sk->sk_data_ready, 仅用于TCP
+	struct bpf_prog			*stream_verdict; /* 流接收重定向的重定向prog, 替换sk->sk_data_ready, 与stream_parser共用使用时用于TCP
 							  * prog type: BPF_PROG_TYPE_SK_SKB
 							  * 对应attach type: BPF_SK_SKB_STREAM_VERDICT
 							  * 注: stream_verdict可单独使用
@@ -80,10 +86,12 @@ enum sk_psock_state_bits {
 	SK_PSOCK_TX_ENABLED,
 };
 
-struct sk_psock_link {
-	struct list_head		list;
-	struct bpf_map			*map;
-	void				*link_raw;
+struct sk_psock_link {	/* 用于将sockmap以及其保存sk的地址 与 psock联系起来,
+			 * 如此sock就能通过psock->link找到所有该sock加入的sockmap和地址, 便于sock关闭时清除
+			 */
+	struct list_head		list;		/* 链入psock->link链表 */
+	struct bpf_map			*map;		/* 指向sockmap/sockhash结构 */
+	void				*link_raw;	/* sockmap/sockhash中保存sock的地址 */
 };
 
 struct sk_psock_work_state {
@@ -94,12 +102,20 @@ struct sk_psock_work_state {
 
 struct sk_psock { /* 保存在sk->sk_user_data中 */
 	struct sock			*sk;
-	struct sock			*sk_redir;
-	u32				apply_bytes;
-	u32				cork_bytes;
-	u32				eval;
-	struct sk_msg			*cork;
-	struct sk_psock_progs		progs;
+	struct sock			*sk_redir;	/* msg_parser用来保存重定向的目的sock */
+	u32				apply_bytes;	/* 需要应用同一个msg_parser结果的字节数,
+							 * 比如发送一个大文件时, 只需要一开始的数据就能决定重定向的目的sock,
+							 * 那么msg_parser prog中就可以调用bpf_msg_apply_bytes()设置应用同一结果的字节数,
+							 * 这样发完该大小的数据后才会再次调用msg_parser prog, 减少频繁调用prog的消耗
+							 */
+	u32				cork_bytes;	/* 如果设置了sk_msg->cork_bytes, 表示还需要累计的字节数,
+							 * 减为0时说明数据量达足够了, 可以调用msg_parser prog了
+							 */
+	u32				eval;		/* 保存执行执行msg_parser prog的返回值, 为enum __sk_action
+							 * 初始化为__SK_NONE, 表示需要调用msg_parser prog
+							 */
+	struct sk_msg			*cork;		/* 如果设置了cork_bytes, 用来保存上次缓存的msg */
+	struct sk_psock_progs		progs;		/* 保存attach到sockmap/sockhash上的progs */
 #if IS_ENABLED(CONFIG_BPF_STREAM_PARSER)
 	struct strparser		strp;		/* strparser结构 */
 #endif
@@ -118,7 +134,7 @@ struct sk_psock { /* 保存在sk->sk_user_data中 */
 	refcount_t			refcnt;
 	/* 以下save_xxx分别保存对应原协议的函数, 比如tcp_port->unhash等 */
 	void (*saved_unhash)(struct sock *sk);
-	void (*saved_close)(struct sock *sk, long timeout);
+	void (*saved_close)(struct sock *sk, long timeout); /* 保存原来的prot->close, 如tcp_close() */
 	void (*saved_write_space)(struct sock *sk); /* 保存原始的sk->sk_write_space
 						     * 使用strparser的话在sk_psock_start_strp()中会被替换成sk_psock_write_space()
 						     */
@@ -569,7 +585,7 @@ static inline struct sock *skb_bpf_redirect_fetch(const struct sk_buff *skb)
 {
 	unsigned long sk_redir = skb->_sk_redir;
 
-	/* bpf程序如果调用bpf_sk_redirect_map(),
+	/* bpf程序如果调用bpf_sk_redirect_map()/bpf_sk_redirect_hash(),
 	 * 会把从sockmap得到的sock和BPF_F_INGRESS标志保存在skb->_sk_redir中,
 	 * 所以这里返回的是目的sock
 	 */

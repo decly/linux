@@ -849,7 +849,7 @@ EXPORT_SYMBOL_GPL(sk_psock_drop);
 static int sk_psock_map_verd(int verdict, bool redir)
 {
 	switch (verdict) {
-	case SK_PASS:
+	case SK_PASS: /* PASS表示需要继续, 可能重定向(redir)也可能不修改(!redir) */
 		return redir ? __SK_REDIRECT : __SK_PASS;
 	case SK_DROP:
 	default:
@@ -866,22 +866,29 @@ int sk_psock_msg_verdict(struct sock *sk, struct sk_psock *psock,
 	int ret;
 
 	rcu_read_lock();
-	prog = READ_ONCE(psock->progs.msg_parser);
+	prog = READ_ONCE(psock->progs.msg_parser); /* 获取attach到sockmap上的msg_parser */
 	if (unlikely(!prog)) {
-		ret = __SK_PASS;
+		ret = __SK_PASS; /* 无prog程序不修改 */
 		goto out;
 	}
 
 	sk_msg_compute_data_pointers(msg);
 	msg->sk = sk;
+	/* 这里执行msg_parser prog程序
+	 * 1.如果prog需要重定向到其他sock会调用bpf_msg_redirect_map()/bpf_msg_redirect_hash()
+	 * 来重定向到其他sock, 这时会将重定向的sock保存在msg->sk_redir中, BPF_F_INGRESS标志保存在msg->flags
+	 * 2.如果prog不需要改变msg的路径, 那么msg->sk_redir为空
+	 * 以上两种都是返回SK_PASS, 只有在出错或者需要丢弃时才返回SK_DROP
+	 */
 	ret = bpf_prog_run_pin_on_cpu(prog, msg);
+	/* 将返回值ret转为__sk_action的一种 */
 	ret = sk_psock_map_verd(ret, msg->sk_redir);
-	psock->apply_bytes = msg->apply_bytes;
-	if (ret == __SK_REDIRECT) {
+	psock->apply_bytes = msg->apply_bytes; /* 需要应用同一个结果的字节数 */
+	if (ret == __SK_REDIRECT) { /* 需要重定向到其他sock */
 		if (psock->sk_redir)
 			sock_put(psock->sk_redir);
-		psock->sk_redir = msg->sk_redir;
-		if (!psock->sk_redir) {
+		psock->sk_redir = msg->sk_redir; /* 重定向目的sock保存到psock */
+		if (!psock->sk_redir) { /* 出错 */
 			ret = __SK_DROP;
 			goto out;
 		}

@@ -2546,6 +2546,11 @@ static const struct bpf_func_proto bpf_redirect_neigh_proto = {
 	.arg4_type	= ARG_ANYTHING,
 };
 
+/* 设置需要应用同一个重定向结果的字节数,
+ * 比如发送一个大文件时, 只需要一开始的数据就能决定重定向的目的sock,
+ * 那么msg_parser prog中就可以调用bpf_msg_apply_bytes()设置应用同一结果的字节数,
+ * 这样发完该大小的数据后才会再次调用msg_parser prog, 减少频繁调用prog的消耗
+ */
 BPF_CALL_2(bpf_msg_apply_bytes, struct sk_msg *, msg, u32, bytes)
 {
 	msg->apply_bytes = bytes;
@@ -2560,6 +2565,12 @@ static const struct bpf_func_proto bpf_msg_apply_bytes_proto = {
 	.arg2_type      = ARG_ANYTHING,
 };
 
+/* 设置需要等待累计cork_bytes字节的数据才调用msg_parser prog
+ * 比如需要用来确定重定向的数据可能跨越多次的sendmsg(),
+ * 那么就可以使用该接口通知psock达到cork_bytes数据量再调用msg_parser prog进行判断.
+ * 注意: 当调用时提供的msg数据长度达不到cork_bytes时(比如首次还是需要调用msg_parser prog),
+ * 	 msg_parser prog结果是忽略的, 也就是数据不会被发送而是缓存累计起来等到足量.
+ */
 BPF_CALL_2(bpf_msg_cork_bytes, struct sk_msg *, msg, u32, bytes)
 {
 	msg->cork_bytes = bytes;

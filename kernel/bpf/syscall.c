@@ -3120,11 +3120,11 @@ attach_type_to_prog_type(enum bpf_attach_type attach_type)
 	case BPF_CGROUP_DEVICE:
 		return BPF_PROG_TYPE_CGROUP_DEVICE;
 	case BPF_SK_MSG_VERDICT:
-		return BPF_PROG_TYPE_SK_MSG;
+		return BPF_PROG_TYPE_SK_MSG; /* sockmap的发送重定向 */
 	case BPF_SK_SKB_STREAM_PARSER:
 	case BPF_SK_SKB_STREAM_VERDICT:
 	case BPF_SK_SKB_VERDICT:
-		return BPF_PROG_TYPE_SK_SKB;
+		return BPF_PROG_TYPE_SK_SKB; /* sockmap的接收重定向 */
 	case BPF_LIRC_MODE2:
 		return BPF_PROG_TYPE_LIRC_MODE2;
 	case BPF_FLOW_DISSECTOR:
