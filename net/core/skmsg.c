@@ -872,7 +872,7 @@ int sk_psock_msg_verdict(struct sock *sk, struct sk_psock *psock,
 		goto out;
 	}
 
-	sk_msg_compute_data_pointers(msg);
+	sk_msg_compute_data_pointers(msg); /* 初始化msg->data和data_len */
 	msg->sk = sk;
 	/* 这里执行msg_parser prog程序
 	 * 1.如果prog需要重定向到其他sock会调用bpf_msg_redirect_map()/bpf_msg_redirect_hash()

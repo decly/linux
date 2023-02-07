@@ -3115,7 +3115,7 @@ attach_type_to_prog_type(enum bpf_attach_type attach_type)
 	case BPF_CGROUP_UDP4_RECVMSG:
 	case BPF_CGROUP_UDP6_RECVMSG:
 		return BPF_PROG_TYPE_CGROUP_SOCK_ADDR;
-	case BPF_CGROUP_SOCK_OPS:
+	case BPF_CGROUP_SOCK_OPS: /* cgroup…œattach sockops */
 		return BPF_PROG_TYPE_SOCK_OPS;
 	case BPF_CGROUP_DEVICE:
 		return BPF_PROG_TYPE_CGROUP_DEVICE;
@@ -3195,7 +3195,7 @@ static int bpf_prog_attach(const union bpf_attr *attr)
 	case BPF_PROG_TYPE_CGROUP_SOCK_ADDR:
 	case BPF_PROG_TYPE_CGROUP_SOCKOPT:
 	case BPF_PROG_TYPE_CGROUP_SYSCTL:
-	case BPF_PROG_TYPE_SOCK_OPS:
+	case BPF_PROG_TYPE_SOCK_OPS: /* sockops */
 		ret = cgroup_bpf_prog_attach(attr, ptype, prog);
 		break;
 	default:

@@ -13,7 +13,7 @@
 #include <net/tcp.h>
 #include <net/strparser.h>
 
-#define MAX_MSG_FRAGS			MAX_SKB_FRAGS
+#define MAX_MSG_FRAGS			MAX_SKB_FRAGS	/* 17 */
 #define NR_MSG_FRAG_IDS			(MAX_MSG_FRAGS + 1)
 
 enum __sk_action {
@@ -43,7 +43,10 @@ static_assert(BITS_PER_LONG >= NR_MSG_FRAG_IDS);
 /* UAPI in filter.c depends on struct sk_msg_sg being first element. */
 struct sk_msg {
 	struct sk_msg_sg		sg;
-	void				*data;
+	void				*data;		/* sendmsg()调用中data和data_end只指向首个scatterlist中的数据
+							 * 而对于sendpage()则为NULL
+							 * 详见sk_msg_compute_data_pointers()
+							 */
 	void				*data_end;
 	u32				apply_bytes;	/* 需要应用同一个重定向结果的字节数,
 							 * 由msg_parser程序中调用bpf_msg_apply_bytes()设置
@@ -278,14 +281,15 @@ static inline bool sk_msg_to_ingress(const struct sk_msg *msg)
 	return msg->flags & BPF_F_INGRESS;
 }
 
+/* 初始化msg->data和data_len */
 static inline void sk_msg_compute_data_pointers(struct sk_msg *msg)
 {
 	struct scatterlist *sge = sk_msg_elem(msg, msg->sg.start);
 
-	if (test_bit(msg->sg.start, &msg->sg.copy)) {
+	if (test_bit(msg->sg.start, &msg->sg.copy)) { /* sendpage调用会设置copy位, data为NULL */
 		msg->data = NULL;
 		msg->data_end = NULL;
-	} else {
+	} else { /* sendmsg调用data和data_end指向首个scatterlist的数据 */
 		msg->data = sg_virt(sge);
 		msg->data_end = msg->data + sge->length;
 	}

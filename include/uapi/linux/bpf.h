@@ -1056,6 +1056,43 @@ enum bpf_link_type {
  * All eligible programs are executed regardless of return code from
  * earlier programs.
  */
+/* attach时可以指定attach flags(bpftool中的ATTACH_FLAGS可以指定), 默认不指定(NONE)以及三个flags:
+ * NONE: 不指定flag, 其所有cgroup子树中不允许重复attach prog,只会执行本cgroup中的bpf程序
+ * BPF_F_ALLOW_OVERRIDE: 表示其子cgroup可以attach自己的prog来覆盖本cgroup的prog,
+ * 			 即如果子cgroup也安装了bpf程序, 那么子cgroup中只会执行子cgroup自己的prog
+ * BPF_F_ALLOW_MULTI: 表示同时允许多个bpf程序, 即如果子cgroup也安装了bpf程序,
+ * 		      那么子cgroup中父子的cgroup的bpf程序都会被执行,
+ * 		      且按照子到父的顺序执行, 同一层级按照attach的先后顺序
+ * BPF_F_REPLACE: 在使用BPF_F_ALLOW_MULTI的同时使用BPF_F_REPLACE来替换指定的prog
+ *
+ *
+ * 这几个标志的特点上面注释解释很清楚(举得例子也有代表性), 规则大概如下:
+ *
+ * -默认(NONE未设置)和指定override都只允许一个bpf程序存在一个cgroup中; override和multi标志不能共存
+ * -带有MULTI或OVERRIDE标志的cgroup允许子cgroup中有任何附加标志,
+ *  而带有NONE的cgroup(即未设置)不允许子cgroup中有任何程序
+ * -同一层级cgroup执行prog顺序按照attach的先后执行,不同层级cgroup先执行子cgroup的程序,
+ *  然后执行本cgroup的程序, 再执行父cgroup的程序
+ * -所有符合条件的prog程序都会被执行, 而不管程序的返回代码是什么(与prog中返回值无关)
+ * -使用BPF_F_ALLOW_MULTI时新prog被添加到cgroup的程序列表的末尾,
+ *  但可以同时使用BPF_F_REPLACE来替换现有的prog
+ *
+ *
+ * 举个例子(上面注释的例子), 有如下cgroup层级, 标志和attach的prog如括号中所示：
+ *
+ *   cgrp1 (MULTI progs A, B) ->
+ *    cgrp2 (OVERRIDE prog C) ->
+ *      cgrp3 (MULTI prog D) ->
+ *        cgrp4 (OVERRIDE prog E) ->
+ *          cgrp5 (NONE prog F)
+ *
+ * 对cgrp5组来说：
+ * prog的执行顺序为: F,D,A,B                   => 按照从cgroup叶子节点往上执行的顺序,同一层级按照先后顺序(A, B)
+ *                                                并且cgrp4和cgrp2都有override标识, 被子cgroup组代替, 所以C和E不执行
+ * 如果detach掉F, 那么执行顺序为: E,D,A,B      => F被detach后, E就不会被覆盖了
+ * 如果detach掉F和D, 那么执行顺序为: E,A,B     => D被detach后, cgrp2的C还是会被cgrp4的E覆盖, 所以C不执行
+ * 如果detach掉F,E和D, 那么执行顺序为: C,A,B   => 这时候C不会被子cgroup组覆盖了, 所以执行C
+ */
 #define BPF_F_ALLOW_OVERRIDE	(1U << 0)
 #define BPF_F_ALLOW_MULTI	(1U << 1)
 #define BPF_F_REPLACE		(1U << 2)
@@ -5484,6 +5521,7 @@ enum sk_action {
  * be added to the end of this structure
  */
 struct sk_msg_md { /* msg_parser prog的上下文参数, 初始化详见sk_msg_convert_ctx_access() */
+	/* 默认时, sendmsg()调用中data和data_end只指向首个scatterlist中的数据, 而对于sendpage()则为NULL */
 	__bpf_md_ptr(void *, data);	/* 即sk_msg->data */
 	__bpf_md_ptr(void *, data_end);	/* 即sk_msg->data_end */
 
