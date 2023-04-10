@@ -5537,21 +5537,23 @@ struct sk_msg_md { /* msg_parser prog的上下文参数, 初始化详见sk_msg_convert_ctx_
 	__bpf_md_ptr(struct bpf_sock *, sk); /* current socket */ /* 即sk_msg->sk */
 };
 
-struct sk_reuseport_md {
+struct sk_reuseport_md { /* BPF_PROG_TYPE_SK_REUSEPORT的上下文, 初始化详见sk_reuseport_convert_ctx_access() */
 	/*
 	 * Start of directly accessible data. It begins from
 	 * the tcp/udp header.
 	 */
-	__bpf_md_ptr(void *, data);
+	__bpf_md_ptr(void *, data);	/* 指向tcp/udp首部, 即skb->data */
 	/* End of directly accessible data */
-	__bpf_md_ptr(void *, data_end);
+	__bpf_md_ptr(void *, data_end);	/* 指向skb线性化的尾部, 即skb->data + skb_headlen(skb) */
 	/*
 	 * Total length of packet (starting from the tcp/udp header).
 	 * Note that the directly accessible bytes (data_end - data)
 	 * could be less than this "len".  Those bytes could be
 	 * indirectly read by a helper "bpf_skb_load_bytes()".
 	 */
-	__u32 len;
+	__u32 len;	/* 从tcp/udp首部算起的skb总长度, 即skb->len,
+			 * skb非线性化的话len > data_end - data, 需要通过bpf_skb_load_bytes()来访问数据
+			 */
 	/*
 	 * Eth protocol in the mac header (network byte order). e.g.
 	 * ETH_P_IP(0x0800) and ETH_P_IPV6(0x86DD)
