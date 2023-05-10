@@ -325,7 +325,7 @@ static char **parse_bytes(char **argv, const char *name, unsigned char *val,
 		argv++;
 	}
 
-	while (i < n && argv[i]) {
+	while (i < n && argv[i]) { /* 按照每个参数一字节解析 */
 		val[i] = strtoul(argv[i], &endptr, base);
 		if (*endptr) {
 			p_err("error parsing byte: %s", argv[i]);
@@ -367,7 +367,7 @@ static int parse_elem(char **argv, struct bpf_map_info *info,
 		return -1;
 	}
 
-	if (is_prefix(*argv, "key")) {
+	if (is_prefix(*argv, "key")) { /* 解析key参数 */
 		if (!key) {
 			if (key_size)
 				p_err("duplicate key");
@@ -376,13 +376,17 @@ static int parse_elem(char **argv, struct bpf_map_info *info,
 			return -1;
 		}
 
+		/* 按照每个参数一字节解析key, 保存到@key中
+		 * 比如key_size为4字节的话, 则 key [hex] 1 0 0 0 表示key=0x1
+		 */
 		argv = parse_bytes(argv + 1, "key", key, key_size);
 		if (!argv)
 			return -1;
 
+		/* 继续调用获取其他参数(key已经解析了置为NULL) */
 		return parse_elem(argv, info, NULL, value, key_size, value_size,
 				  flags, value_fd);
-	} else if (is_prefix(*argv, "value")) {
+	} else if (is_prefix(*argv, "value")) { /* 解析value参数 */
 		int fd;
 
 		if (!value) {
@@ -395,7 +399,7 @@ static int parse_elem(char **argv, struct bpf_map_info *info,
 
 		argv++;
 
-		if (map_is_map_of_maps(info->type)) {
+		if (map_is_map_of_maps(info->type)) { /* 如果是map-in-map */
 			int argc = 2;
 
 			if (value_size != 4) {
@@ -407,10 +411,12 @@ static int parse_elem(char **argv, struct bpf_map_info *info,
 				return -1;
 			}
 
+			/* 获取inner map的fd */
 			fd = map_parse_fd(&argc, &argv);
 			if (fd < 0)
 				return -1;
 
+			/* 将value_fd指向value保存inner map fd */
 			*value_fd = value;
 			**value_fd = fd;
 		} else if (map_is_map_of_progs(info->type)) {
@@ -434,18 +440,23 @@ static int parse_elem(char **argv, struct bpf_map_info *info,
 
 			*value_fd = value;
 			**value_fd = fd;
-		} else {
+		} else { /* 普通的map */
+			/* 按照每个参数一字节解析value, 保存到@value中
+			 * 比如value_size为4字节的话, 则 value [hex] 1 0 0 0 表示value=0x1
+			 */
 			argv = parse_bytes(argv, "value", value, value_size);
 			if (!argv)
 				return -1;
 
+			/* 如果是percpu类型的, 那么将value拷贝cpu次数 */
 			fill_per_cpu_value(info, value);
 		}
 
+		/* 继续调用获取其他参数(value已经解析了置为NULL) */
 		return parse_elem(argv, info, key, NULL, key_size, value_size,
 				  flags, NULL);
 	} else if (is_prefix(*argv, "any") || is_prefix(*argv, "noexist") ||
-		   is_prefix(*argv, "exist")) {
+		   is_prefix(*argv, "exist")) { /* 解析flags */
 		if (!flags) {
 			p_err("flags specified multiple times: %s", *argv);
 			return -1;
@@ -610,6 +621,10 @@ static int show_map_close_plain(int fd, struct bpf_map_info *info)
 	}
 	close(fd);
 
+	/* 打印PIN路径
+	 * 之前build_pinned_obj_table()已经将所有PIN文件保存到map_table中了
+	 * 比较id号相同即表示同一个map
+	 */
 	if (!hash_empty(map_table.table)) {
 		struct pinned_obj *obj;
 
@@ -694,20 +709,25 @@ static int do_show(int argc, char **argv)
 	int err;
 	int fd;
 
+	/* 如果需要打印pinned路径(指定了-f选项),
+	 * 那遍历mount的bpf文件系统内的所有pin文件, 然后保存在map_table表里
+	 * 后面show_map_close_plain()会通过逐一比较map id来确认pinned
+	 */
 	if (show_pinned)
 		build_pinned_obj_table(&map_table, BPF_OBJ_MAP);
 	build_obj_refs_table(&refs_table, BPF_OBJ_MAP);
 
-	if (argc == 2)
+	if (argc == 2) /* 指定了map */
 		return do_show_subset(argc, argv);
 
+	/* 打印所有map, 不能带参数 */
 	if (argc)
 		return BAD_ARG();
 
 	if (json_output)
 		jsonw_start_array(json_wtr);
 	while (true) {
-		err = bpf_map_get_next_id(id, &id);
+		err = bpf_map_get_next_id(id, &id); /* 从id=0开始遍历所有map */
 		if (err) {
 			if (errno == ENOENT)
 				break;
@@ -732,6 +752,7 @@ static int do_show(int argc, char **argv)
 			break;
 		}
 
+		/* 打印map信息 */
 		if (json_output)
 			show_map_close_json(fd, &info);
 		else
@@ -784,7 +805,7 @@ static int maps_have_btf(int *fds, int nb_fds)
 			return -1;
 		}
 
-		if (!info.btf_id)
+		if (!info.btf_id) /* 有btf_id表示支持BTF */
 			return 0;
 	}
 
@@ -871,6 +892,7 @@ map_dump(int fd, struct bpf_map_info *info, json_writer_t *wtr,
 		p_info("Warning: cannot read values from %s map with value_size != 8",
 		       map_type_name[info->type]);
 	while (true) {
+		/* 从头(prev_key = NULL)开始遍历所有key, 下一个key会返回给参数key */
 		err = bpf_map_get_next_key(fd, prev_key, key);
 		if (err) {
 			if (errno == ENOENT)
@@ -917,7 +939,7 @@ static int do_dump(int argc, char **argv)
 		p_err("mem alloc failed");
 		return -1;
 	}
-	nb_fds = map_parse_fds(&argc, &argv, &fds);
+	nb_fds = map_parse_fds(&argc, &argv, &fds); /* 查找map返回map fd到fds数组 */
 	if (nb_fds < 1)
 		goto exit_free;
 
@@ -945,7 +967,7 @@ static int do_dump(int argc, char **argv)
 			p_err("can't get map info: %s", strerror(errno));
 			break;
 		}
-		err = map_dump(fds[i], &info, wtr, nb_fds > 1);
+		err = map_dump(fds[i], &info, wtr, nb_fds > 1); /* 打印map信息 */
 		if (!wtr && i != nb_fds - 1)
 			printf("\n");
 
@@ -1005,20 +1027,22 @@ static int do_update(int argc, char **argv)
 	if (argc < 2)
 		usage();
 
-	fd = map_parse_fd_and_info(&argc, &argv, &info, &len);
+	fd = map_parse_fd_and_info(&argc, &argv, &info, &len); /* 找到map并打开 */
 	if (fd < 0)
 		return -1;
 
-	err = alloc_key_value(&info, &key, &value);
+	/* 如果存在key_size或value_size则分配保存key和value的内存 */
+	err = alloc_key_value(&info, &key, &value); 
 	if (err)
 		goto exit_free;
 
+	/* 解析参数赋值key, value, flags等 */
 	err = parse_elem(argv, &info, key, value, info.key_size,
 			 info.value_size, &flags, &value_fd);
 	if (err)
 		goto exit_free;
 
-	err = bpf_map_update_elem(fd, key, value, flags);
+	err = bpf_map_update_elem(fd, key, value, flags); /* update操作 */
 	if (err) {
 		p_err("update failed: %s", strerror(errno));
 		goto exit_free;
@@ -1087,6 +1111,7 @@ static int do_lookup(int argc, char **argv)
 	if (argc < 2)
 		usage();
 
+	/* 根据参数查找map得到fd */
 	fd = map_parse_fd_and_info(&argc, &argv, &info, &len);
 	if (fd < 0)
 		return -1;
@@ -1138,7 +1163,7 @@ static int do_getnext(int argc, char **argv)
 	if (argc < 2)
 		usage();
 
-	fd = map_parse_fd_and_info(&argc, &argv, &info, &len);
+	fd = map_parse_fd_and_info(&argc, &argv, &info, &len); /* 找到map */
 	if (fd < 0)
 		return -1;
 
@@ -1150,17 +1175,17 @@ static int do_getnext(int argc, char **argv)
 		goto exit_free;
 	}
 
-	if (argc) {
+	if (argc) { /* 指定key参数则先解析key */
 		err = parse_elem(argv, &info, key, NULL, info.key_size, 0,
 				 NULL, NULL);
 		if (err)
 			goto exit_free;
-	} else {
+	} else { /* 没指定key参数则默认从0找起, 返回首个key */
 		free(key);
 		key = NULL;
 	}
 
-	err = bpf_map_get_next_key(fd, key, nextkey);
+	err = bpf_map_get_next_key(fd, key, nextkey); /* 查找key的下一个key保存在nextkey中 */
 	if (err) {
 		p_err("can't get next key: %s", strerror(errno));
 		goto exit_free;
@@ -1186,7 +1211,7 @@ static int do_getnext(int argc, char **argv)
 			printf("key: None\n");
 		}
 		printf("next key:\n");
-		fprint_hex(stdout, nextkey, info.key_size, " ");
+		fprint_hex(stdout, nextkey, info.key_size, " "); /* 输出nextkey */
 		printf("\n");
 	}
 
@@ -1209,6 +1234,7 @@ static int do_delete(int argc, char **argv)
 	if (argc < 2)
 		usage();
 
+	/* 通过参数找到map */
 	fd = map_parse_fd_and_info(&argc, &argv, &info, &len);
 	if (fd < 0)
 		return -1;
@@ -1220,11 +1246,12 @@ static int do_delete(int argc, char **argv)
 		goto exit_free;
 	}
 
+	/* 通过参数解析key保存到@key */
 	err = parse_elem(argv, &info, key, NULL, info.key_size, 0, NULL, NULL);
 	if (err)
 		goto exit_free;
 
-	err = bpf_map_delete_elem(fd, key);
+	err = bpf_map_delete_elem(fd, key); /* 删除操作 */
 	if (err)
 		p_err("delete failed: %s", strerror(errno));
 
@@ -1255,9 +1282,14 @@ static int do_create(int argc, char **argv)
 
 	if (!REQ_ARGS(7))
 		return -1;
-	pinfile = GET_ARG();
+	pinfile = GET_ARG(); /* 指定PIN路径 */
 
 	while (argc) {
+ 		/* 接下来参数都是双数:
+		 * type TYPE 		key KEY_SIZE 	value VALUE_SIZE
+		 * entries MAX_ENTRIES 	name NAME
+		 * [flags FLAGS] 	[inner_map MAP]	[dev NAME]
+		 */
 		if (!REQ_ARGS(2))
 			return -1;
 
@@ -1335,13 +1367,13 @@ static int do_create(int argc, char **argv)
 
 	set_max_rlimit();
 
-	fd = bpf_create_map_xattr(&attr);
+	fd = bpf_create_map_xattr(&attr); /* 创建map */
 	if (fd < 0) {
 		p_err("map create failed: %s", strerror(errno));
 		goto exit;
 	}
 
-	err = do_pin_fd(fd, pinfile);
+	err = do_pin_fd(fd, pinfile); /* 将map PIN到bpffs */
 	close(fd);
 	if (err)
 		goto exit;
@@ -1375,6 +1407,7 @@ static int do_pop_dequeue(int argc, char **argv)
 	if (err)
 		goto exit_free;
 
+	/* 查找key删除元素并获取value */
 	err = bpf_map_lookup_and_delete_elem(fd, key, value);
 	if (err) {
 		if (errno == ENOENT) {

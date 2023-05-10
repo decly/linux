@@ -112,10 +112,10 @@ struct pinned_obj_table {
 	DECLARE_HASHTABLE(table, 16);
 };
 
-struct pinned_obj {
-	__u32 id;
-	char *path;
-	struct hlist_node hash;
+struct pinned_obj {	/* 表示一个PIN对象 */
+	__u32 id; 	/* bpf id */
+	char *path;	/* pin文件路径 */
+	struct hlist_node hash; /* 用来链入pinned_obj_table哈希表 */
 };
 
 struct obj_refs_table {

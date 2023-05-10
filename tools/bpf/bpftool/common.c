@@ -262,11 +262,11 @@ int do_pin_fd(int fd, const char *name)
 {
 	int err;
 
-	err = mount_bpffs_for_pin(name);
+	err = mount_bpffs_for_pin(name); /* 检查name路径是否为bpffs, 不是则挂载bpffs */
 	if (err)
 		return err;
 
-	err = bpf_obj_pin(fd, name);
+	err = bpf_obj_pin(fd, name); /* 将fd PIN到name路径 */
 	if (err)
 		p_err("can't pin the object (%s): %s", name, strerror(errno));
 
@@ -278,11 +278,11 @@ int do_pin_any(int argc, char **argv, int (*get_fd)(int *, char ***))
 	int err;
 	int fd;
 
-	fd = get_fd(&argc, &argv);
+	fd = get_fd(&argc, &argv); /* 通过参数查找返回fd */
 	if (fd < 0)
 		return fd;
 
-	err = do_pin_fd(fd, *argv);
+	err = do_pin_fd(fd, *argv); /* PIN操作 */
 
 	close(fd);
 	return err;
@@ -302,6 +302,7 @@ const char *get_fd_type_name(enum bpf_obj_type type)
 	return names[type];
 }
 
+/* 根据bpf fd判断对应的类型: prog,map,link等 */
 int get_fd_type(int fd)
 {
 	char path[PATH_MAX];
@@ -310,6 +311,7 @@ int get_fd_type(int fd)
 
 	snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
 
+	/* 读取/proc/xxx/fd/[fd]软连接内容到buf */
 	n = readlink(path, buf, sizeof(buf));
 	if (n < 0) {
 		p_err("can't read link type: %s", strerror(errno));
@@ -320,6 +322,7 @@ int get_fd_type(int fd)
 		return -1;
 	}
 
+	/* 根据软连接的字符串判断fd对应的类型 */
 	if (strstr(buf, "bpf-map"))
 		return BPF_OBJ_MAP;
 	else if (strstr(buf, "bpf-prog"))
@@ -405,13 +408,14 @@ static int do_build_table_cb(const char *fpath, const struct stat *sb,
 	enum bpf_obj_type objtype;
 	int fd, err = 0;
 
-	if (typeflag != FTW_F)
+	if (typeflag != FTW_F) /* 只处理文件 */
 		goto out_ret;
 
-	fd = open_obj_pinned(fpath, true);
+	fd = open_obj_pinned(fpath, true); /* 打开PIN文件 */
 	if (fd < 0)
 		goto out_ret;
 
+	/* 获取PIN的类型, map或prog, 不是则跳过 */
 	objtype = get_fd_type(fd);
 	if (objtype != build_fn_type)
 		goto out_close;
@@ -420,6 +424,7 @@ static int do_build_table_cb(const char *fpath, const struct stat *sb,
 	if (bpf_obj_get_info_by_fd(fd, &pinned_info, &len))
 		goto out_close;
 
+	/* 分配并初始化PIN对象pinned_obj */
 	obj_node = calloc(1, sizeof(*obj_node));
 	if (!obj_node) {
 		err = -1;
@@ -434,6 +439,7 @@ static int do_build_table_cb(const char *fpath, const struct stat *sb,
 		goto out_close;
 	}
 
+	/* 将pinned_obj对象链接到哈希表 */
 	hash_add(build_fn_table->table, &obj_node->hash, obj_node->id);
 out_close:
 	close(fd);
@@ -441,6 +447,7 @@ out_ret:
 	return err;
 }
 
+/* 遍历所有bpffs中的所有PIN文件, 将对应类型type的PIN保存到哈希表tab中 */
 int build_pinned_obj_table(struct pinned_obj_table *tab,
 			   enum bpf_obj_type type)
 {
@@ -454,14 +461,17 @@ int build_pinned_obj_table(struct pinned_obj_table *tab,
 	if (!mntfile)
 		return -1;
 
-	build_fn_table = tab;
-	build_fn_type = type;
+	build_fn_table = tab; /* 用来保存所有相关PIN的哈希表 */
+	build_fn_type = type; /* 指定类型map或prog, do_build_table_cb()里用来判断 */
 
-	while ((mntent = getmntent(mntfile))) {
+	while ((mntent = getmntent(mntfile))) { /* 遍历所有mountpoint */
 		char *path = mntent->mnt_dir;
 
-		if (strncmp(mntent->mnt_type, "bpf", 3) != 0)
+		if (strncmp(mntent->mnt_type, "bpf", 3) != 0) /* 找到bpffs */
 			continue;
+		/* nftw会针对bpffs中的所有文件调用do_build_table_cb(),
+		 * 将相关的PIN保存到哈希表build_fn_table中
+		 */
 		err = nftw(path, do_build_table_cb, nopenfd, flags);
 		if (err)
 			break;
@@ -870,6 +880,9 @@ err_close_fds:
 	return -1;
 }
 
+/* 通过参数查找map, 返回到fds中(通过name指定可能有多个map, 所以fds为数组)
+ * MAP := { id MAP_ID | pinned FILE | name MAP_NAME }
+ */
 int map_parse_fds(int *argc, char ***argv, int **fds)
 {
 	if (is_prefix(**argv, "id")) {
