@@ -375,17 +375,20 @@ static bool hierarchy_allows_attach(struct cgroup *cgrp,
 	struct cgroup *p;
 
 	p = cgroup_parent(cgrp);
-	if (!p)
+	if (!p) /* 根cgroup直接允许 */
 		return true;
-	do {
+	do { /* 循环递归所有父group */
 		u32 flags = p->bpf.flags[atype];
 		u32 cnt;
 
+		/* 如果某个祖辈cgroup设置了BPF_F_ALLOW_MULTI, 那么允许其子孙cgroup attach */
 		if (flags & BPF_F_ALLOW_MULTI)
 			return true;
 		cnt = prog_list_length(&p->bpf.progs[atype]);
 		WARN_ON_ONCE(cnt > 1);
-		if (cnt == 1)
+		if (cnt == 1) /* 如果某个祖辈cgroup已经attach了prog,
+			       * 那么只有其设置了BPF_F_ALLOW_OVERRIDE才允许其子孙cgroup attach
+			       */
 			return !!(flags & BPF_F_ALLOW_OVERRIDE);
 		p = cgroup_parent(p);
 	} while (p);
@@ -562,7 +565,7 @@ static struct bpf_prog_list *find_attach_entry(struct hlist_head *progs,
 	struct bpf_prog_list *pl;
 
 	/* single-attach case */
-	if (!allow_multi) {
+	if (!allow_multi) { /* 不允许多个prog, 那么只可能为空或第一个 */
 		if (hlist_empty(progs))
 			return NULL;
 		return hlist_entry(progs->first, typeof(*pl), node);
@@ -580,7 +583,7 @@ static struct bpf_prog_list *find_attach_entry(struct hlist_head *progs,
 	/* direct prog multi-attach w/ replacement case */
 	if (replace_prog) {
 		hlist_for_each_entry(pl, progs, node) {
-			if (pl->prog == replace_prog)
+			if (pl->prog == replace_prog) /* 找到要被代替的prog */
 				/* a match found */
 				return pl;
 		}
@@ -619,6 +622,7 @@ static int __cgroup_bpf_attach(struct cgroup *cgrp,
 	struct hlist_head *progs;
 	int err;
 
+	/* override和multi标志不能共存, replace标志必须同时有multi标志 */
 	if (((flags & BPF_F_ALLOW_OVERRIDE) && (flags & BPF_F_ALLOW_MULTI)) ||
 	    ((flags & BPF_F_REPLACE) && !(flags & BPF_F_ALLOW_MULTI)))
 		/* invalid combination */
@@ -630,15 +634,26 @@ static int __cgroup_bpf_attach(struct cgroup *cgrp,
 		/* replace_prog implies BPF_F_REPLACE, and vice versa */
 		return -EINVAL;
 
-	atype = bpf_cgroup_atype_find(type, new_prog->aux->attach_btf_id);
+	atype = bpf_cgroup_atype_find(type, new_prog->aux->attach_btf_id); /* 转成cgroup_bpf_attach_type类型 */
 	if (atype < 0)
 		return -EINVAL;
 
-	progs = &cgrp->bpf.progs[atype];
+	progs = &cgrp->bpf.progs[atype]; /* 对应类型的attach prog链表 */
 
+	/* 检查cgroup层级是否允许attach该类型(atype)的prog:
+	 * 1.根cgroup直接允许attach
+	 * 2.如果某个祖辈cgroup attach了prog并设置了BPF_F_ALLOW_MULTI, 那么允许其子孙cgroup attach,
+	 *   因为该标志表示可以attach多个prog
+	 * 3.否则, 如果某个祖辈cgroup已经attach了prog, 只有其设置了BPF_F_ALLOW_OVERRIDE才允许其子孙cgroup attach
+	 *   因为没指定MULTI的话只允许同时存在一个prog
+	 * 4.若祖辈cgroup都还没有attach prog, 那么可以attach
+	 */
 	if (!hierarchy_allows_attach(cgrp, atype))
 		return -EPERM;
 
+	/* 如果已经attach了该类型的prog, 那么BPF_F_ALLOW_MULTI和BPF_F_ALLOW_OVERRIDE
+	 * 标志应该和之前的一样
+	 */
 	if (!hlist_empty(progs) && cgrp->bpf.flags[atype] != saved_flags)
 		/* Disallow attaching non-overridable on top
 		 * of existing overridable in this cgroup.
@@ -646,9 +661,11 @@ static int __cgroup_bpf_attach(struct cgroup *cgrp,
 		 */
 		return -EPERM;
 
+	/* 一个类型的prog最多attach 64个 */
 	if (prog_list_length(progs) >= BPF_CGROUP_MAX_PROGS)
 		return -E2BIG;
 
+	/* 找到要attach的位置, 为NULL说明是新增 */
 	pl = find_attach_entry(progs, prog, link, replace_prog,
 			       flags & BPF_F_ALLOW_MULTI);
 	if (IS_ERR(pl))
@@ -658,9 +675,9 @@ static int __cgroup_bpf_attach(struct cgroup *cgrp,
 				      prog ? : link->link.prog, cgrp))
 		return -ENOMEM;
 
-	if (pl) {
+	if (pl) { /* 替换旧的prog */
 		old_prog = pl->prog;
-	} else {
+	} else { /* 加入新的prog */
 		struct hlist_node *last = NULL;
 
 		pl = kmalloc(sizeof(*pl), GFP_KERNEL);
@@ -682,7 +699,7 @@ static int __cgroup_bpf_attach(struct cgroup *cgrp,
 	pl->prog = prog;
 	pl->link = link;
 	bpf_cgroup_storages_assign(pl->storage, storage);
-	cgrp->bpf.flags[atype] = saved_flags;
+	cgrp->bpf.flags[atype] = saved_flags; /* 保存flags */
 
 	if (type == BPF_LSM_CGROUP) {
 		err = bpf_trampoline_link_cgroup_shim(new_prog, atype);
@@ -690,7 +707,7 @@ static int __cgroup_bpf_attach(struct cgroup *cgrp,
 			goto cleanup;
 	}
 
-	err = update_effective_progs(cgrp, atype);
+	err = update_effective_progs(cgrp, atype); /* 更新实际生效的prog */
 	if (err)
 		goto cleanup_trampoline;
 
@@ -1137,15 +1154,17 @@ int cgroup_bpf_prog_attach(const union bpf_attr *attr,
 	if (IS_ERR(cgrp))
 		return PTR_ERR(cgrp);
 
+	/* 如果指定了BPF_F_REPLACE表示需要代替已有的prog */
 	if ((attr->attach_flags & BPF_F_ALLOW_MULTI) &&
 	    (attr->attach_flags & BPF_F_REPLACE)) {
-		replace_prog = bpf_prog_get_type(attr->replace_bpf_fd, ptype);
+		replace_prog = bpf_prog_get_type(attr->replace_bpf_fd, ptype); /* 获取要被代替的prog */
 		if (IS_ERR(replace_prog)) {
 			cgroup_put(cgrp);
 			return PTR_ERR(replace_prog);
 		}
 	}
 
+	/* 将prog attach到cgroup */
 	ret = cgroup_bpf_attach(cgrp, prog, replace_prog, NULL,
 				attr->attach_type, attr->attach_flags);
 

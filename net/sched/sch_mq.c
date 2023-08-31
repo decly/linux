@@ -73,27 +73,36 @@ static int mq_init(struct Qdisc *sch, struct nlattr *opt,
 	struct Qdisc *qdisc;
 	unsigned int ntx;
 
+	/* mq只能设置在ROOT上 */
 	if (sch->parent != TC_H_ROOT)
 		return -EOPNOTSUPP;
 
+	/* mq只有网卡多队列才能用 */
 	if (!netif_is_multiqueue(dev))
 		return -EOPNOTSUPP;
 
 	/* pre-allocate qdiscs, attachment can't fail */
+	/* 分配网卡队列个数的qdisc, 用于保存网卡队列自己的qdisc */
 	priv->qdiscs = kcalloc(dev->num_tx_queues, sizeof(priv->qdiscs[0]),
 			       GFP_KERNEL);
 	if (!priv->qdiscs)
 		return -ENOMEM;
 
+	/* 循环针对每个网卡队列设置将default_qdisc保存在priv->qdiscs数组中,
+	 * (mq_attach()时才真正设置到网卡队列中)
+	 */
 	for (ntx = 0; ntx < dev->num_tx_queues; ntx++) {
 		dev_queue = netdev_get_tx_queue(dev, ntx);
+		/*设置为default_qdisc(即/proc/sys/net/core/default_qdisc)
+		 * parent为mq的handle:ntx+1(对应tc要设置时指定的parent)
+		 */
 		qdisc = qdisc_create_dflt(dev_queue, get_default_qdisc_ops(dev, ntx),
 					  TC_H_MAKE(TC_H_MAJ(sch->handle),
 						    TC_H_MIN(ntx + 1)),
 					  extack);
 		if (!qdisc)
 			return -ENOMEM;
-		priv->qdiscs[ntx] = qdisc;
+		priv->qdiscs[ntx] = qdisc; /* qdisc保存在priv中 */
 		qdisc->flags |= TCQ_F_ONETXQUEUE | TCQ_F_NOPARENT;
 	}
 
@@ -110,9 +119,10 @@ static void mq_attach(struct Qdisc *sch)
 	struct Qdisc *qdisc, *old;
 	unsigned int ntx;
 
+	/* 循环网络队列设置qdisc */
 	for (ntx = 0; ntx < dev->num_tx_queues; ntx++) {
-		qdisc = priv->qdiscs[ntx];
-		old = dev_graft_qdisc(qdisc->dev_queue, qdisc);
+		qdisc = priv->qdiscs[ntx]; /* 在mq_init()中将qdisc保存在priv中 */
+		old = dev_graft_qdisc(qdisc->dev_queue, qdisc); /* 设置新的并返回旧的 */
 		if (old)
 			qdisc_put(old);
 #ifdef CONFIG_NET_SCHED
@@ -140,6 +150,7 @@ static int mq_dump(struct Qdisc *sch, struct sk_buff *skb)
 	 * qdiscs. Percpu stats are added to counters in-band and locking
 	 * qdisc totals are added at end.
 	 */
+	/* mq的统计是遍历所有网卡队列的qdisc相加 */
 	for (ntx = 0; ntx < dev->num_tx_queues; ntx++) {
 		qdisc = rtnl_dereference(netdev_get_tx_queue(dev, ntx)->qdisc_sleeping);
 		spin_lock_bh(qdisc_lock(qdisc));
@@ -262,13 +273,17 @@ static const struct Qdisc_class_ops mq_class_ops = {
 	.dump_stats	= mq_dump_class_stats,
 };
 
+/* mq不需要enqueue和dequeue, 因为mq只是一个框架来管理各个网卡队列的qdisc,
+ * 网卡队列中的qdisc还是用的其他的(比如pfifo/fq_codel),
+ * 而dev_queue_xmit发送时也是直接取网卡队列的qdisc, 不会调用mq
+ */
 struct Qdisc_ops mq_qdisc_ops __read_mostly = {
 	.cl_ops		= &mq_class_ops,
 	.id		= "mq",
 	.priv_size	= sizeof(struct mq_sched),
-	.init		= mq_init,
+	.init		= mq_init,	/* 分配并保存网卡队列的qdisc */
 	.destroy	= mq_destroy,
-	.attach		= mq_attach,
+	.attach		= mq_attach,	/* 将qdisc设置到网卡队列 */
 	.change_real_num_tx = mq_change_real_num_tx,
 	.dump		= mq_dump,
 	.owner		= THIS_MODULE,

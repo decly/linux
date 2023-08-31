@@ -267,7 +267,7 @@ int mount_bpffs_for_pin(const char *name, bool is_dir)
 		/* nothing to do if already mounted */
 		goto out_free;
 
-	if (block_mount) {
+	if (block_mount) { /* 指定了-n选项, 不会自动mount bpffs */
 		p_err("no BPF file system found, not mounting it due to --nomount option");
 		err = -1;
 		goto out_free;
@@ -289,11 +289,12 @@ int do_pin_fd(int fd, const char *name)
 {
 	int err;
 
+	/* 检查name路径是否为bpffs, 不是则挂载bpffs */
 	err = mount_bpffs_for_pin(name, false);
 	if (err)
 		return err;
 
-	err = bpf_obj_pin(fd, name);
+	err = bpf_obj_pin(fd, name); /* 将fd PIN到name路径 */
 	if (err)
 		p_err("can't pin the object (%s): %s", name, strerror(errno));
 
@@ -308,11 +309,11 @@ int do_pin_any(int argc, char **argv, int (*get_fd)(int *, char ***))
 	if (!REQ_ARGS(3))
 		return -EINVAL;
 
-	fd = get_fd(&argc, &argv);
+	fd = get_fd(&argc, &argv); /* 通过参数查找返回fd */
 	if (fd < 0)
 		return fd;
 
-	err = do_pin_fd(fd, *argv);
+	err = do_pin_fd(fd, *argv); /* PIN操作 */
 
 	close(fd);
 	return err;
@@ -376,6 +377,7 @@ copy_name:
 		btf__free(prog_btf);
 }
 
+/* 根据bpf fd判断对应的类型: prog,map,link等 */
 int get_fd_type(int fd)
 {
 	char path[PATH_MAX];
@@ -384,6 +386,7 @@ int get_fd_type(int fd)
 
 	snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
 
+	/* 读取/proc/xxx/fd/[fd]软连接内容到buf */
 	n = readlink(path, buf, sizeof(buf));
 	if (n < 0) {
 		p_err("can't read link type: %s", strerror(errno));
@@ -394,6 +397,7 @@ int get_fd_type(int fd)
 		return -1;
 	}
 
+	/* 根据软连接的字符串判断fd对应的类型 */
 	if (strstr(buf, "bpf-map"))
 		return BPF_OBJ_MAP;
 	else if (strstr(buf, "bpf-prog"))
@@ -479,13 +483,14 @@ static int do_build_table_cb(const char *fpath, const struct stat *sb,
 	int fd, err = 0;
 	char *path;
 
-	if (typeflag != FTW_F)
+	if (typeflag != FTW_F) /* 只处理文件 */
 		goto out_ret;
 
-	fd = open_obj_pinned(fpath, true);
+	fd = open_obj_pinned(fpath, true); /* 打开PIN文件 */
 	if (fd < 0)
 		goto out_ret;
 
+	/* 获取PIN的类型, map或prog, 不是则跳过 */
 	objtype = get_fd_type(fd);
 	if (objtype != build_fn_type)
 		goto out_close;
@@ -514,6 +519,7 @@ out_ret:
 	return err;
 }
 
+/* 遍历所有bpffs中的所有PIN文件, 将对应类型type的PIN保存到哈希表tab中 */
 int build_pinned_obj_table(struct hashmap *tab,
 			   enum bpf_obj_type type)
 {
@@ -527,14 +533,17 @@ int build_pinned_obj_table(struct hashmap *tab,
 	if (!mntfile)
 		return -1;
 
-	build_fn_table = tab;
-	build_fn_type = type;
+	build_fn_table = tab; /* 用来保存所有相关PIN的哈希表 */
+	build_fn_type = type; /* 指定类型map或prog, do_build_table_cb()里用来判断 */
 
-	while ((mntent = getmntent(mntfile))) {
+	while ((mntent = getmntent(mntfile))) { /* 遍历所有mountpoint */
 		char *path = mntent->mnt_dir;
 
-		if (strncmp(mntent->mnt_type, "bpf", 3) != 0)
+		if (strncmp(mntent->mnt_type, "bpf", 3) != 0) /* 找到bpffs */
 			continue;
+		/* nftw会针对bpffs中的所有文件调用do_build_table_cb(),
+		 * 将相关的PIN保存到哈希表build_fn_table中
+		 */
 		err = nftw(path, do_build_table_cb, nopenfd, flags);
 		if (err)
 			break;
@@ -743,7 +752,7 @@ static int prog_fd_by_nametag(void *nametag, int **fds, bool tag)
 		struct bpf_prog_info info = {};
 		__u32 len = sizeof(info);
 
-		err = bpf_prog_get_next_id(id, &id);
+		err = bpf_prog_get_next_id(id, &id); /* 从id=0开始遍历所有的prog */
 		if (err) {
 			if (errno != ENOENT) {
 				p_err("%s", strerror(errno));
@@ -766,6 +775,7 @@ static int prog_fd_by_nametag(void *nametag, int **fds, bool tag)
 			goto err_close_fd;
 		}
 
+		/* 比较tag相同或name相同的prog */
 		if (tag && memcmp(nametag, info.tag, BPF_TAG_SIZE)) {
 			close(fd);
 			continue;
@@ -781,6 +791,7 @@ static int prog_fd_by_nametag(void *nametag, int **fds, bool tag)
 		}
 
 		if (nb_fds > 0) {
+		if (nb_fds > 0) { /* 不止一个prog重新分配内存 */
 			tmp = realloc(*fds, (nb_fds + 1) * sizeof(int));
 			if (!tmp) {
 				p_err("failed to realloc");
@@ -788,7 +799,7 @@ static int prog_fd_by_nametag(void *nametag, int **fds, bool tag)
 			}
 			*fds = tmp;
 		}
-		(*fds)[nb_fds++] = fd;
+		(*fds)[nb_fds++] = fd; /* name相同的可能有多个, 所以是数组 */
 	}
 
 err_close_fd:
@@ -799,9 +810,10 @@ err_close_fds:
 	return -1;
 }
 
+/* 通过参数查找prog并将fd保存在fds中 */
 int prog_parse_fds(int *argc, char ***argv, int **fds)
 {
-	if (is_prefix(**argv, "id")) {
+	if (is_prefix(**argv, "id")) { /* 通过id可直接找到prog */
 		unsigned int id;
 		char *endptr;
 
@@ -820,7 +832,7 @@ int prog_parse_fds(int *argc, char ***argv, int **fds)
 			return -1;
 		}
 		return 1;
-	} else if (is_prefix(**argv, "tag")) {
+	} else if (is_prefix(**argv, "tag")) { /* 通过tag需要遍历系统所有prog来匹配tag相等的 */
 		unsigned char tag[BPF_TAG_SIZE];
 
 		NEXT_ARGP();
@@ -834,7 +846,7 @@ int prog_parse_fds(int *argc, char ***argv, int **fds)
 		NEXT_ARGP();
 
 		return prog_fd_by_nametag(tag, fds, true);
-	} else if (is_prefix(**argv, "name")) {
+	} else if (is_prefix(**argv, "name")) { /* 通过name需要遍历系统所有prog来匹配name相等的(可能有多个) */
 		char *name;
 
 		NEXT_ARGP();
@@ -847,7 +859,7 @@ int prog_parse_fds(int *argc, char ***argv, int **fds)
 		NEXT_ARGP();
 
 		return prog_fd_by_nametag(name, fds, false);
-	} else if (is_prefix(**argv, "pinned")) {
+	} else if (is_prefix(**argv, "pinned")) { /* 通过pinned路径可直接找到prog */
 		char *path;
 
 		NEXT_ARGP();
@@ -865,6 +877,9 @@ int prog_parse_fds(int *argc, char ***argv, int **fds)
 	return -1;
 }
 
+/* 通过参数查找prog返回fd
+ * PROG := { id PROG_ID | pinned FILE | tag PROG_TAG | name PROG_NAME }
+ */
 int prog_parse_fd(int *argc, char ***argv)
 {
 	int *fds = NULL;
@@ -950,6 +965,9 @@ err_close_fds:
 	return -1;
 }
 
+/* 通过参数查找map, 返回到fds中(通过name指定可能有多个map, 所以fds为数组)
+ * MAP := { id MAP_ID | pinned FILE | name MAP_NAME }
+ */
 int map_parse_fds(int *argc, char ***argv, int **fds)
 {
 	if (is_prefix(**argv, "id")) {
@@ -1002,6 +1020,9 @@ int map_parse_fds(int *argc, char ***argv, int **fds)
 	return -1;
 }
 
+/* 通过参数查找map返回fd
+ * MAP := { id MAP_ID | pinned FILE | name MAP_NAME }
+ */
 int map_parse_fd(int *argc, char ***argv)
 {
 	int *fds = NULL;
@@ -1012,8 +1033,8 @@ int map_parse_fd(int *argc, char ***argv)
 		p_err("mem alloc failed");
 		return -1;
 	}
-	nb_fds = map_parse_fds(argc, argv, &fds);
-	if (nb_fds != 1) {
+	nb_fds = map_parse_fds(argc, argv, &fds); /* 查找map返回fd */
+	if (nb_fds != 1) { /* 由于如果使用name查找map可能存在多个, 这里返回错误 */
 		if (nb_fds > 1) {
 			p_err("several maps match this handle");
 			while (nb_fds--)

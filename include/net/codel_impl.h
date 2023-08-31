@@ -101,6 +101,10 @@ static codel_time_t codel_control_law(codel_time_t t,
 	return t + reciprocal_scale(interval, rec_inv_sqrt << REC_INV_SQRT_SHIFT);
 }
 
+/* dequeue时判断是否要丢包:
+ * 如果skb发送延迟超过5ms(target)的持续超过100ms(interval),
+ * 则返回true认为可以开始丢包
+ */
 static bool codel_should_drop(const struct sk_buff *skb,
 			      void *ctx,
 			      struct codel_vars *vars,
@@ -119,14 +123,14 @@ static bool codel_should_drop(const struct sk_buff *skb,
 		return false;
 	}
 
-	skb_len = skb_len_func(skb);
-	vars->ldelay = now - skb_time_func(skb);
+	skb_len = skb_len_func(skb); /* 调用qdisc_pkt_len()获取skb的长度 */
+	vars->ldelay = now - skb_time_func(skb); /* 即调用codel_get_enqueue_time()获取该skb enqueue的时间戳 算差值 */
 
 	if (unlikely(skb_len > stats->maxpacket))
 		stats->maxpacket = skb_len;
 
-	if (codel_time_before(vars->ldelay, params->target) ||
-	    *backlog <= params->mtu) {
+	if (codel_time_before(vars->ldelay, params->target) || /* skb被缓存的时间小于5ms(默认) */
+	    *backlog <= params->mtu) { /* qdisc缓存的数据包不超过1个 */
 		/* went below - stay below for at least interval */
 		vars->first_above_time = 0;
 		return false;
@@ -136,8 +140,10 @@ static bool codel_should_drop(const struct sk_buff *skb,
 		/* just went above from below. If we stay above
 		 * for at least interval we'll say it's ok to drop
 		 */
+		/* 延迟持续时间阈值设置为interval(100ms) */
 		vars->first_above_time = now + params->interval;
 	} else if (codel_time_after(now, vars->first_above_time)) {
+		/* 延迟(超过5ms)持续的时间超过了100ms, 可以丢包了 */
 		ok_to_drop = true;
 	}
 	return ok_to_drop;
@@ -153,7 +159,7 @@ static struct sk_buff *codel_dequeue(void *ctx,
 				     codel_skb_drop_t drop_func,
 				     codel_skb_dequeue_t dequeue_func)
 {
-	struct sk_buff *skb = dequeue_func(vars, ctx);
+	struct sk_buff *skb = dequeue_func(vars, ctx); /* 从flow中dequeue首个skb */
 	codel_time_t now;
 	bool drop;
 
@@ -162,10 +168,15 @@ static struct sk_buff *codel_dequeue(void *ctx,
 		return skb;
 	}
 	now = codel_get_time();
+	/* 判断是否要丢包:
+	 * 如果skb发送延迟超过5ms(target)的持续超过100ms(interval),
+	 * 则返回true认为可以开始丢包
+	 * 注意: 丢包状态是按flow粒度的, 不是整个qdisc
+	 */
 	drop = codel_should_drop(skb, ctx, vars, params, stats,
 				 skb_len_func, skb_time_func, backlog, now);
-	if (vars->dropping) {
-		if (!drop) {
+	if (vars->dropping) { /* 已经处于丢包状态 */
+		if (!drop) { /* 结束丢包状态 */
 			/* sojourn time below target - leave dropping state */
 			vars->dropping = false;
 		} else if (codel_time_after_eq(now, vars->drop_next)) {
@@ -183,6 +194,7 @@ static struct sk_buff *codel_dequeue(void *ctx,
 						* since there is no more divide
 						*/
 				codel_Newton_step(vars);
+				/* 开启ecn(默认开启), 设置CE标记取代丢包 */
 				if (params->ecn && INET_ECN_set_ce(skb)) {
 					stats->ecn_mark++;
 					vars->drop_next =
@@ -192,31 +204,32 @@ static struct sk_buff *codel_dequeue(void *ctx,
 					goto end;
 				}
 				stats->drop_len += skb_len_func(skb);
-				drop_func(skb, ctx);
+				drop_func(skb, ctx); /* 丢弃本skb */
 				stats->drop_count++;
-				skb = dequeue_func(vars, ctx);
+				skb = dequeue_func(vars, ctx); /* 获取下一个skb */
 				if (!codel_should_drop(skb, ctx,
 						       vars, params, stats,
 						       skb_len_func,
 						       skb_time_func,
 						       backlog, now)) {
 					/* leave dropping state */
-					vars->dropping = false;
+					vars->dropping = false; /* 可以退出丢包状态 */
 				} else {
 					/* and schedule the next drop */
-					vars->drop_next =
+					vars->drop_next = /* 计算下一个丢包周期 */
 						codel_control_law(vars->drop_next,
 								  params->interval,
 								  vars->rec_inv_sqrt);
 				}
 			}
 		}
-	} else if (drop) {
+	} else if (drop) { /* 要进入丢包状态 */
 		u32 delta;
 
+		/* 开启ecn(默认开启), 设置CE标记取代丢包 */
 		if (params->ecn && INET_ECN_set_ce(skb)) {
 			stats->ecn_mark++;
-		} else {
+		} else { /* 丢弃一个skb获取下一个(一个丢包周期丢一个skb) */
 			stats->drop_len += skb_len_func(skb);
 			drop_func(skb, ctx);
 			stats->drop_count++;
@@ -250,6 +263,7 @@ static struct sk_buff *codel_dequeue(void *ctx,
 						    vars->rec_inv_sqrt);
 	}
 end:
+	/* skb发送时如果延迟时间超过ce_threshold则标记CE */
 	if (skb && codel_time_after(vars->ldelay, params->ce_threshold)) {
 		bool set_ce = true;
 

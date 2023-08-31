@@ -910,34 +910,65 @@ struct tc_fq_codel_xstats {
 enum {
 	TCA_FQ_UNSPEC,
 
+	/* tc参数limit: 限制每个qdisc队列(对应网卡队列)缓存的数据包个数，超过后会丢弃；默认10000 */
 	TCA_FQ_PLIMIT,		/* limit of total number of packets in queue */
 
+	/* tc参数flow_limit: 限制每个流缓存的数据包个数，超过后会丢弃；默认100 */
 	TCA_FQ_FLOW_PLIMIT,	/* limit of packets per flow */
 
+	/* tc参数quantum：流每次的发送配额, 单位为字节, 可用来控制pacing粒度;
+	 * 默认为2个数据包大小3028(mtu 1500 +14 eth), 即一个流每次发送2个数据包
+	 */
 	TCA_FQ_QUANTUM,		/* RR quantum */
 
+	/* tc参数initial_quantum: 流初始化发送配额, 可用来控制首RTT不参与pacing的数据包个数;
+	 * 默认为10个数据包大小15140, 即首个RTT发送10个包不pacing
+	 */
 	TCA_FQ_INITIAL_QUANTUM,		/* RR quantum for new flow */
 
+	/* tc参数[no]pacing: 设置是否pacing, 默认pacing */
 	TCA_FQ_RATE_ENABLE,	/* enable/disable rate limiting */
 
+	/* 已经弃用 */
 	TCA_FQ_FLOW_DEFAULT_RATE,/* obsolete, do not use */
 
+	/* tc参数maxrate: 设置最大发送速率pacing_rate, 单位bps(tc指定bps单位会识别成bytes/s), 默认不配置(~0) */
 	TCA_FQ_FLOW_MAX_RATE,	/* per flow max rate */
 
+	/* tc参数buckets: 存储流的红黑树个数, 默认1024个红黑树 */
 	TCA_FQ_BUCKETS_LOG,	/* log2(number of buckets) */
 
+	/* tc参数refill_delay: 流idle时间(无数据包可发送)超过该值后才能补配额, 默认40ms */
 	TCA_FQ_FLOW_REFILL_DELAY,	/* flow credit refill delay in usec */
 
+	/* tc参数orphan_mask: orphaned skb(比如synack，udp包)在流红黑树中的存储掩码,
+	 * 设置为buckets-1即可, 默认1024-1
+	 */
 	TCA_FQ_ORPHAN_MASK,	/* mask applied to orphaned skb hashes */
 
+	/* tc参数low_rate_threshold: 当pacing rate低于low_rate_threshold时(单位bps，默认550Kbps),
+	 * 为了保证pacing的精度, 不用每次发满配额，保证pacing更细化
+	 */
 	TCA_FQ_LOW_RATE_THRESHOLD, /* per packet delay under this rate */
 
+	/* tc参数ce_threshold: skb发送时, 如果离skb本该发送的时间超过ce_threshold阈值,
+	 * 说明负载过高本地拥塞了, 那么就设置ECN标志. 单位微秒，默认4294秒.
+	 */
 	TCA_FQ_CE_THRESHOLD,	/* DCTCP-like CE-marking threshold */
 
+	/* tc参数timer_slack: 当目前没有流需要立刻发送数据包时, 会激活定时器. 时间为首个需要发送数据包的时间,
+	 * 定时器并不是完全准时的, 而timer_slack为定时器允许的松弛时间，单位为纳秒，默认10微秒.
+	 */
 	TCA_FQ_TIMER_SLACK,	/* timer slack */
 
+	/* tc参数horizon: 上层(比如EDT)设置skb的发送时间不能超过horizon,
+	 * 否则丢弃或置为该值(由horizon_cap/drop确定), 单位微秒，默认10秒
+	 */
 	TCA_FQ_HORIZON,		/* time horizon in us */
 
+	/* tc参数horizon_{cap|drop}: 控制上层(比如EDT)设置skb的发送时间超过horizon后,
+	 * 丢弃(horizon_drop)或置为horizon(horizon_cap), 默认丢弃
+	 */
 	TCA_FQ_HORIZON_DROP,	/* drop packets beyond horizon, or cap their EDT */
 
 	__TCA_FQ_MAX

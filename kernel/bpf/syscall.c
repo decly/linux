@@ -161,7 +161,7 @@ static int bpf_map_update_value(struct bpf_map *map, struct file *map_file,
 		return map->ops->map_update_elem(map, key, value, flags);
 	} else if (map->map_type == BPF_MAP_TYPE_SOCKHASH ||
 		   map->map_type == BPF_MAP_TYPE_SOCKMAP) {
-		return sock_map_update_elem_sys(map, key, value, flags);
+		return sock_map_update_elem_sys(map, key, value, flags); /* sockmap/sockhash调用 */
 	} else if (IS_FD_PROG_ARRAY(map)) {
 		return bpf_fd_array_map_update_elem(map, map_file, key, value,
 						    flags);
@@ -1133,12 +1133,12 @@ static int map_create(union bpf_attr *attr)
 	if (map_type >= ARRAY_SIZE(bpf_map_types))
 		return -EINVAL;
 	map_type = array_index_nospec(map_type, ARRAY_SIZE(bpf_map_types));
-	ops = bpf_map_types[map_type];
+	ops = bpf_map_types[map_type]; /* 获取对应map类型的操作函数 */
 	if (!ops)
 		return -EINVAL;
 
 	if (ops->map_alloc_check) {
-		err = ops->map_alloc_check(attr);
+		err = ops->map_alloc_check(attr); /* map初始化前的检查 */
 		if (err)
 			return err;
 	}
@@ -1203,10 +1203,10 @@ static int map_create(union bpf_attr *attr)
 		return -EPERM;
 	}
 
-	map = ops->map_alloc(attr);
+	map = ops->map_alloc(attr); /* 分配map内存 */
 	if (IS_ERR(map))
 		return PTR_ERR(map);
-	map->ops = ops;
+	map->ops = ops; /* 保存ops */
 	map->map_type = map_type;
 
 	err = bpf_obj_name_cpy(map->name, attr->map_name,
@@ -1258,13 +1258,13 @@ static int map_create(union bpf_attr *attr)
 	if (err)
 		goto free_map;
 
-	err = bpf_map_alloc_id(map);
+	err = bpf_map_alloc_id(map); /* 给map分配一个唯一ID */
 	if (err)
 		goto free_map_sec;
 
 	bpf_map_save_memcg(map);
 
-	err = bpf_map_new_fd(map, f_flags);
+	err = bpf_map_new_fd(map, f_flags); /* 分配fd */
 	if (err < 0) {
 		/* failed to allocate fd.
 		 * bpf_map_put_with_uref() is needed because the above
@@ -1454,7 +1454,7 @@ static int map_lookup_elem(union bpf_attr *attr)
 		goto free_value;
 	}
 
-	err = bpf_map_copy_value(map, key, value, attr->flags);
+	err = bpf_map_copy_value(map, key, value, attr->flags); /* 这里调用lookup */
 	if (err)
 		goto free_value;
 
@@ -1491,7 +1491,7 @@ static int map_update_elem(union bpf_attr *attr, bpfptr_t uattr)
 		return -EINVAL;
 
 	f = fdget(ufd);
-	map = __bpf_map_get(f);
+	map = __bpf_map_get(f); /* 通过fd找到map */
 	if (IS_ERR(map))
 		return PTR_ERR(map);
 	bpf_map_write_active_inc(map);
@@ -1519,6 +1519,7 @@ static int map_update_elem(union bpf_attr *attr, bpfptr_t uattr)
 		goto free_key;
 	}
 
+	/* 实际update操作 */
 	err = bpf_map_update_value(map, f.file, key, value, attr->flags);
 
 	kvfree(value);
@@ -3555,16 +3556,16 @@ attach_type_to_prog_type(enum bpf_attach_type attach_type)
 	case BPF_CGROUP_UDP4_RECVMSG:
 	case BPF_CGROUP_UDP6_RECVMSG:
 		return BPF_PROG_TYPE_CGROUP_SOCK_ADDR;
-	case BPF_CGROUP_SOCK_OPS:
+	case BPF_CGROUP_SOCK_OPS: /* cgroup上attach sockops */
 		return BPF_PROG_TYPE_SOCK_OPS;
 	case BPF_CGROUP_DEVICE:
 		return BPF_PROG_TYPE_CGROUP_DEVICE;
 	case BPF_SK_MSG_VERDICT:
-		return BPF_PROG_TYPE_SK_MSG;
+		return BPF_PROG_TYPE_SK_MSG; /* sockmap的发送重定向 */
 	case BPF_SK_SKB_STREAM_PARSER:
 	case BPF_SK_SKB_STREAM_VERDICT:
 	case BPF_SK_SKB_VERDICT:
-		return BPF_PROG_TYPE_SK_SKB;
+		return BPF_PROG_TYPE_SK_SKB; /* sockmap的接收重定向 */
 	case BPF_LIRC_MODE2:
 		return BPF_PROG_TYPE_LIRC_MODE2;
 	case BPF_FLOW_DISSECTOR:
@@ -3610,10 +3611,12 @@ static int bpf_prog_attach(const union bpf_attr *attr)
 	if (attr->attach_flags & ~BPF_F_ATTACH_MASK)
 		return -EINVAL;
 
+	/* attach type转化成prog type */
 	ptype = attach_type_to_prog_type(attr->attach_type);
 	if (ptype == BPF_PROG_TYPE_UNSPEC)
 		return -EINVAL;
 
+	/* 根据attach_bpf_fd获取prog, 并检查prog type是否匹配ptype */
 	prog = bpf_prog_get_type(attr->attach_bpf_fd, ptype);
 	if (IS_ERR(prog))
 		return PTR_ERR(prog);
@@ -3626,6 +3629,7 @@ static int bpf_prog_attach(const union bpf_attr *attr)
 	switch (ptype) {
 	case BPF_PROG_TYPE_SK_SKB:
 	case BPF_PROG_TYPE_SK_MSG:
+		/* sockmap/sockhash: 将prog保存在sockmap/sockhash中  */
 		ret = sock_map_get_from_fd(attr, prog);
 		break;
 	case BPF_PROG_TYPE_LIRC_MODE2:
@@ -3640,7 +3644,7 @@ static int bpf_prog_attach(const union bpf_attr *attr)
 	case BPF_PROG_TYPE_CGROUP_SOCK_ADDR:
 	case BPF_PROG_TYPE_CGROUP_SOCKOPT:
 	case BPF_PROG_TYPE_CGROUP_SYSCTL:
-	case BPF_PROG_TYPE_SOCK_OPS:
+	case BPF_PROG_TYPE_SOCK_OPS: /* sockops */
 	case BPF_PROG_TYPE_LSM:
 		if (ptype == BPF_PROG_TYPE_LSM &&
 		    prog->expected_attach_type != BPF_LSM_CGROUP)
@@ -3666,11 +3670,13 @@ static int bpf_prog_detach(const union bpf_attr *attr)
 	if (CHECK_ATTR(BPF_PROG_DETACH))
 		return -EINVAL;
 
+	/* attach type转化成prog type */
 	ptype = attach_type_to_prog_type(attr->attach_type);
 
 	switch (ptype) {
 	case BPF_PROG_TYPE_SK_MSG:
 	case BPF_PROG_TYPE_SK_SKB:
+		/* sockmap/sockhash: 将prog从sockmap/sockhash中删除  */
 		return sock_map_prog_detach(attr, ptype);
 	case BPF_PROG_TYPE_LIRC_MODE2:
 		return lirc_prog_detach(attr);
@@ -5115,13 +5121,13 @@ static int __sys_bpf(int cmd, bpfptr_t uattr, unsigned int size)
 		return err;
 
 	switch (cmd) {
-	case BPF_MAP_CREATE:
+	case BPF_MAP_CREATE: /* 创建map */
 		err = map_create(&attr);
 		break;
 	case BPF_MAP_LOOKUP_ELEM:
 		err = map_lookup_elem(&attr);
 		break;
-	case BPF_MAP_UPDATE_ELEM:
+	case BPF_MAP_UPDATE_ELEM: /* map的update操作 */
 		err = map_update_elem(&attr, uattr);
 		break;
 	case BPF_MAP_DELETE_ELEM:
@@ -5133,7 +5139,7 @@ static int __sys_bpf(int cmd, bpfptr_t uattr, unsigned int size)
 	case BPF_MAP_FREEZE:
 		err = map_freeze(&attr);
 		break;
-	case BPF_PROG_LOAD:
+	case BPF_PROG_LOAD: /* 载入prog */
 		err = bpf_prog_load(&attr, uattr, size);
 		break;
 	case BPF_OBJ_PIN:
@@ -5142,10 +5148,10 @@ static int __sys_bpf(int cmd, bpfptr_t uattr, unsigned int size)
 	case BPF_OBJ_GET:
 		err = bpf_obj_get(&attr);
 		break;
-	case BPF_PROG_ATTACH:
+	case BPF_PROG_ATTACH: /* attach操作, libbpf的bpf_prog_attach()调用 */
 		err = bpf_prog_attach(&attr);
 		break;
-	case BPF_PROG_DETACH:
+	case BPF_PROG_DETACH: /* detach操作, libbpf的bpf_prog_detach2()调用 */
 		err = bpf_prog_detach(&attr);
 		break;
 	case BPF_PROG_QUERY:
@@ -5154,7 +5160,7 @@ static int __sys_bpf(int cmd, bpfptr_t uattr, unsigned int size)
 	case BPF_PROG_TEST_RUN:
 		err = bpf_prog_test_run(&attr, uattr.user);
 		break;
-	case BPF_PROG_GET_NEXT_ID:
+	case BPF_PROG_GET_NEXT_ID: /* 获取给定prog id的下个prog的ID, 用于遍历prog */
 		err = bpf_obj_get_next_id(&attr, uattr.user,
 					  &prog_idr, &prog_idr_lock);
 		break;
@@ -5166,13 +5172,13 @@ static int __sys_bpf(int cmd, bpfptr_t uattr, unsigned int size)
 		err = bpf_obj_get_next_id(&attr, uattr.user,
 					  &btf_idr, &btf_idr_lock);
 		break;
-	case BPF_PROG_GET_FD_BY_ID:
+	case BPF_PROG_GET_FD_BY_ID: /* 通过prog id获取对应的fd */
 		err = bpf_prog_get_fd_by_id(&attr);
 		break;
 	case BPF_MAP_GET_FD_BY_ID:
 		err = bpf_map_get_fd_by_id(&attr);
 		break;
-	case BPF_OBJ_GET_INFO_BY_FD:
+	case BPF_OBJ_GET_INFO_BY_FD: /* 通过fd获取prog/map/btf等的详细信息, 即bpftool显示的 */
 		err = bpf_obj_get_info_by_fd(&attr, uattr.user);
 		break;
 	case BPF_RAW_TRACEPOINT_OPEN:

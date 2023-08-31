@@ -551,8 +551,11 @@ static int sk_psock_skb_ingress_enqueue(struct sk_buff *skb,
 	msg->sg.end = num_sge;
 	msg->skb = skb;
 
-	sk_psock_queue_msg(psock, msg);
-	sk_psock_data_ready(sk, psock);
+	sk_psock_queue_msg(psock, msg); /* 加入到psock->ingress_msg */
+	sk_psock_data_ready(sk, psock); /* 这里调用原始的sk_data_ready来唤醒应用层接收,
+					 * 然后应用层调用recv()时会调用tcp_bpf_recvmsg()
+					 * 来从poskc->ingress_msg接收数据
+					 */
 	return copied;
 }
 
@@ -570,8 +573,13 @@ static int sk_psock_skb_ingress(struct sk_psock *psock, struct sk_buff *skb,
 	 * skip memory accounting and owner transition seeing it already set
 	 * correctly.
 	 */
+	/* skb->sk是原始接收的sk, 相等说明是发给自己的,
+	 * 那么只需要将skb加入到sock的psock->ingress_msg
+	 */
 	if (unlikely(skb->sk == sk))
 		return sk_psock_skb_ingress_self(psock, skb, off, len);
+	/* 否则, 就是其他sock发送过来的, 区别就是需要检查接收缓存等 */
+
 	msg = sk_psock_create_ingress_msg(sk, skb);
 	if (!msg)
 		return -EAGAIN;
@@ -612,11 +620,16 @@ static int sk_psock_skb_ingress_self(struct sk_psock *psock, struct sk_buff *skb
 static int sk_psock_handle_skb(struct sk_psock *psock, struct sk_buff *skb,
 			       u32 off, u32 len, bool ingress)
 {
-	if (!ingress) {
+	if (!ingress) { /* 发送 */
+		/* 发送缓存满了则返回EAGAIN稍后再试 */
 		if (!sock_writeable(psock->sk))
 			return -EAGAIN;
+		/* 会调用sendmsg()将skb发送出去 */
 		return skb_send_sock(psock->sk, skb, off, len);
 	}
+	/* 接收数据到psock->ingress_msg, 然后唤醒应用层,
+	 * 应用层调用recv()时会调用tcp_bpf_recvmsg()从ingress_msg中接收数据
+	 */
 	return sk_psock_skb_ingress(psock, skb, off, len);
 }
 
@@ -632,6 +645,9 @@ static void sk_psock_skb_state(struct sk_psock *psock,
 	spin_unlock_bh(&psock->ingress_lock);
 }
 
+/* 循环处理后备队列psock->ingress_skb, 根据ingress方向(BPF_F_INGRESS标志)接收或发送skb
+ * 接收的话则加入到ingress_msg队列, 发送的话则调用sendmsg发送出去
+ */
 static void sk_psock_backlog(struct work_struct *work)
 {
 	struct delayed_work *dwork = to_delayed_work(work);
@@ -642,12 +658,14 @@ static void sk_psock_backlog(struct work_struct *work)
 	bool ingress;
 	int ret;
 
+	/* 如果有上次EAGAIN没处理完的继续处理 */
 	mutex_lock(&psock->work_mutex);
 	if (unlikely(state->len)) {
 		len = state->len;
 		off = state->off;
 	}
 
+	/* 循环处理后备队列ingress_skb, 根据ingress方向接收或发送skb */
 	while ((skb = skb_peek(&psock->ingress_skb))) {
 		len = skb->len;
 		off = 0;
@@ -657,15 +675,17 @@ static void sk_psock_backlog(struct work_struct *work)
 			off = stm->offset;
 			len = stm->full_len;
 		}
-		ingress = skb_bpf_ingress(skb);
+		ingress = skb_bpf_ingress(skb); /* 获取收发方向, 1为接收, 0为发送 */
 		skb_bpf_redirect_clear(skb);
 		do {
 			ret = -EIO;
 			if (!sock_flag(psock->sk, SOCK_DEAD))
+				/* 这里负责skb的接收或发送 */
 				ret = sk_psock_handle_skb(psock, skb, off,
 							  len, ingress);
 			if (ret <= 0) {
 				if (ret == -EAGAIN) {
+					/* 记录到work_state中, 下次进来再处理 */
 					sk_psock_skb_state(psock, state, len, off);
 
 					/* Delay slightly to prioritize any
@@ -685,6 +705,7 @@ static void sk_psock_backlog(struct work_struct *work)
 		} while (len);
 
 		skb = skb_dequeue(&psock->ingress_skb);
+		/* 发送的话则需要释放skb */
 		if (!ingress) {
 			kfree_skb(skb);
 		}
@@ -737,6 +758,7 @@ struct sk_psock *sk_psock_init(struct sock *sk, int node)
 	sk_psock_set_state(psock, SK_PSOCK_TX_ENABLED);
 	refcount_set(&psock->refcnt, 1);
 
+ 	/* 将psock地址保存在sk->sk_user_data, 后面可以用sk_psock()获取 */
 	__rcu_assign_sk_user_data_with_flags(sk, psock,
 					     SK_USER_DATA_NOCOPY |
 					     SK_USER_DATA_PSOCK);
@@ -776,11 +798,12 @@ static void __sk_psock_zap_ingress(struct sk_psock *psock)
 {
 	struct sk_buff *skb;
 
+	/* 删除ingress_skb队列 */
 	while ((skb = skb_dequeue(&psock->ingress_skb)) != NULL) {
 		skb_bpf_redirect_clear(skb);
 		sock_drop(psock->sk, skb);
 	}
-	__sk_psock_purge_ingress_msg(psock);
+	__sk_psock_purge_ingress_msg(psock); /* 删除ingress_msg队列 */
 }
 
 static void sk_psock_link_destroy(struct sk_psock *psock)
@@ -812,7 +835,7 @@ static void sk_psock_destroy(struct work_struct *work)
 	sk_psock_done_strp(psock);
 
 	cancel_delayed_work_sync(&psock->work);
-	__sk_psock_zap_ingress(psock);
+	__sk_psock_zap_ingress(psock); /* 删除ingress_skb和ingress_msg队列 */
 	mutex_destroy(&psock->work_mutex);
 
 	psock_progs_drop(&psock->progs);
@@ -844,10 +867,11 @@ void sk_psock_drop(struct sock *sk, struct sk_psock *psock)
 }
 EXPORT_SYMBOL_GPL(sk_psock_drop);
 
+/* redir为1说明需要转发到其他sock */
 static int sk_psock_map_verd(int verdict, bool redir)
 {
 	switch (verdict) {
-	case SK_PASS:
+	case SK_PASS: /* PASS表示需要继续, 可能重定向(redir)也可能不修改(!redir) */
 		return redir ? __SK_REDIRECT : __SK_PASS;
 	case SK_DROP:
 	default:
@@ -864,28 +888,35 @@ int sk_psock_msg_verdict(struct sock *sk, struct sk_psock *psock,
 	int ret;
 
 	rcu_read_lock();
-	prog = READ_ONCE(psock->progs.msg_parser);
+	prog = READ_ONCE(psock->progs.msg_parser); /* 获取attach到sockmap上的msg_parser */
 	if (unlikely(!prog)) {
-		ret = __SK_PASS;
+		ret = __SK_PASS; /* 无prog程序不修改 */
 		goto out;
 	}
 
-	sk_msg_compute_data_pointers(msg);
+	sk_msg_compute_data_pointers(msg); /* 初始化msg->data和data_len */
 	msg->sk = sk;
+	/* 这里执行msg_parser prog程序
+	 * 1.如果prog需要重定向到其他sock会调用bpf_msg_redirect_map()/bpf_msg_redirect_hash()
+	 * 来重定向到其他sock, 这时会将重定向的sock保存在msg->sk_redir中, BPF_F_INGRESS标志保存在msg->flags
+	 * 2.如果prog不需要改变msg的路径, 那么msg->sk_redir为空
+	 * 以上两种都是返回SK_PASS, 只有在出错或者需要丢弃时才返回SK_DROP
+	 */
 	ret = bpf_prog_run_pin_on_cpu(prog, msg);
+	/* 将返回值ret转为__sk_action的一种 */
 	ret = sk_psock_map_verd(ret, msg->sk_redir);
-	psock->apply_bytes = msg->apply_bytes;
-	if (ret == __SK_REDIRECT) {
+	psock->apply_bytes = msg->apply_bytes; /* 需要应用同一个结果的字节数 */
+	if (ret == __SK_REDIRECT) { /* 需要重定向到其他sock */
 		if (psock->sk_redir) {
 			sock_put(psock->sk_redir);
 			psock->sk_redir = NULL;
 		}
-		if (!msg->sk_redir) {
+		if (!msg->sk_redir) { /* 出错 */
 			ret = __SK_DROP;
 			goto out;
 		}
 		psock->redir_ingress = sk_msg_to_ingress(msg);
-		psock->sk_redir = msg->sk_redir;
+		psock->sk_redir = msg->sk_redir; /* 重定向目的sock保存到psock */
 		sock_hold(psock->sk_redir);
 	}
 out:
@@ -899,7 +930,7 @@ static int sk_psock_skb_redirect(struct sk_psock *from, struct sk_buff *skb)
 	struct sk_psock *psock_other;
 	struct sock *sk_other;
 
-	sk_other = skb_bpf_redirect_fetch(skb);
+	sk_other = skb_bpf_redirect_fetch(skb); /* 获取目的sock */
 	/* This error is a buggy BPF program, it returned a redirect
 	 * return code, but then didn't set a redirect interface.
 	 */
@@ -926,6 +957,9 @@ static int sk_psock_skb_redirect(struct sk_psock *from, struct sk_buff *skb)
 		return -EIO;
 	}
 
+	/* 将skb加入到目的sock的ingress_skb,
+	 * 工作队列sk_psock_backlog会处理接收或发送
+	 */
 	skb_queue_tail(&psock_other->ingress_skb, skb);
 	schedule_delayed_work(&psock_other->work, 0);
 	spin_unlock_bh(&psock_other->ingress_lock);
@@ -975,20 +1009,25 @@ static int sk_psock_verdict_apply(struct sk_psock *psock, struct sk_buff *skb,
 	u32 len, off;
 
 	switch (verdict) {
-	case __SK_PASS:
+	case __SK_PASS: /* 由本sock处理 */
 		err = -EIO;
 		sk_other = psock->sk;
 		if (sock_flag(sk_other, SOCK_DEAD) ||
 		    !sk_psock_test_state(psock, SK_PSOCK_TX_ENABLED))
 			goto out_free;
 
-		skb_bpf_set_ingress(skb);
+		skb_bpf_set_ingress(skb); /* 设置接收标志, 后续由自身sock接收 */
 
 		/* If the queue is empty then we can submit directly
 		 * into the msg queue. If its not empty we have to
 		 * queue work otherwise we may get OOO data. Otherwise,
 		 * if sk_psock_skb_ingress errors will be handled by
 		 * retrying later from workqueue.
+		 */
+		/* 如果ingress_skb是空的, 说明没有其他sock重定向过来的数据
+		 * 那么就可以直接加入ingress_msg中;
+		 * 否则为了确保数据不乱序, 需要加入到ingress_skb中
+		 * 再由工作队列sk_psock_backlog统一处理
 		 */
 		if (skb_queue_empty(&psock->ingress_skb)) {
 			len = skb->len;
@@ -999,12 +1038,15 @@ static int sk_psock_verdict_apply(struct sk_psock *psock, struct sk_buff *skb,
 				off = stm->offset;
 				len = stm->full_len;
 			}
+			/* 将skb转成sk_msg保存到psock->ingress_msg中, 然后唤醒应用层 */
 			err = sk_psock_skb_ingress_self(psock, skb, off, len);
 		}
 		if (err < 0) {
 			spin_lock_bh(&psock->ingress_lock);
+			/* 加到ingress_skb中让工作队列处理 */
 			if (sk_psock_test_state(psock, SK_PSOCK_TX_ENABLED)) {
 				skb_queue_tail(&psock->ingress_skb, skb);
+				/* 工作队列函数sk_psock_backlog */
 				schedule_delayed_work(&psock->work, 0);
 				err = 0;
 			}
@@ -1013,7 +1055,7 @@ static int sk_psock_verdict_apply(struct sk_psock *psock, struct sk_buff *skb,
 				goto out_free;
 		}
 		break;
-	case __SK_REDIRECT:
+	case __SK_REDIRECT: /* 重定向到其他sock处理 */
 		tcp_eat_skb(psock->sk, skb);
 		err = sk_psock_skb_redirect(psock, skb);
 		break;
@@ -1065,11 +1107,14 @@ static void sk_psock_strp_read(struct strparser *strp, struct sk_buff *skb)
 		skb->sk = sk;
 		skb_dst_drop(skb);
 		skb_bpf_redirect_clear(skb);
+ 		/* 执行我们attach到sockmap的stream_verdict bpf程序 */
 		ret = bpf_prog_run_pin_on_cpu(prog, skb);
 		skb_bpf_set_strparser(skb);
+		/* 将返回值ret转为__sk_action的一种 */
 		ret = sk_psock_map_verd(ret, skb_bpf_redirect_fetch(skb));
 		skb->sk = NULL;
 	}
+	/* 真正处理数据接收或重定向 */
 	sk_psock_verdict_apply(psock, skb, ret);
 out:
 	rcu_read_unlock();
@@ -1090,6 +1135,7 @@ static int sk_psock_strp_parse(struct strparser *strp, struct sk_buff *skb)
 	prog = READ_ONCE(psock->progs.stream_parser);
 	if (likely(prog)) {
 		skb->sk = psock->sk;
+ 		/* 执行我们attach到sockmap的stream_parser bpf程序 */
 		ret = bpf_prog_run_pin_on_cpu(prog, skb);
 		skb->sk = NULL;
 	}
@@ -1111,7 +1157,7 @@ static void sk_psock_strp_data_ready(struct sock *sk)
 			psock->saved_data_ready(sk);
 		} else {
 			write_lock_bh(&sk->sk_callback_lock);
-			strp_data_ready(&psock->strp);
+			strp_data_ready(&psock->strp); /* 调用strparser接收 */
 			write_unlock_bh(&sk->sk_callback_lock);
 		}
 	}
@@ -1128,6 +1174,7 @@ int sk_psock_init_strp(struct sock *sk, struct sk_psock *psock)
 		.parse_msg	= sk_psock_strp_parse,
 	};
 
+	/* 初始化strparser, 设置上面cb的回调函数 */
 	ret = strp_init(&psock->strp, sk, &cb);
 	if (!ret)
 		sk_psock_set_state(psock, SK_PSOCK_RX_STRP_ENABLED);
@@ -1184,15 +1231,19 @@ static int sk_psock_verdict_recv(struct sock *sk, struct sk_buff *skb)
 		sock_drop(sk, skb);
 		goto out;
 	}
+	/* 获取stream_verdict或skb_verdict prog程序 */
 	prog = READ_ONCE(psock->progs.stream_verdict);
 	if (!prog)
 		prog = READ_ONCE(psock->progs.skb_verdict);
 	if (likely(prog)) {
 		skb_dst_drop(skb);
 		skb_bpf_redirect_clear(skb);
+ 		/* 执行我们attach到sockmap的stream_verdict/skb_verdict bpf程序 */
 		ret = bpf_prog_run_pin_on_cpu(prog, skb);
+		/* 将返回值ret转为__sk_action的一种 */
 		ret = sk_psock_map_verd(ret, skb_bpf_redirect_fetch(skb));
 	}
+	/* 真正处理数据接收或重定向 */
 	ret = sk_psock_verdict_apply(psock, skb, ret);
 	if (ret < 0)
 		len = ret;
@@ -1228,7 +1279,7 @@ void sk_psock_start_verdict(struct sock *sk, struct sk_psock *psock)
 		return;
 
 	psock->saved_data_ready = sk->sk_data_ready;
-	sk->sk_data_ready = sk_psock_verdict_data_ready;
+	sk->sk_data_ready = sk_psock_verdict_data_ready; /* 替换为verdict的核心接收处理函数 */
 	sk->sk_write_space = sk_psock_write_space;
 }
 

@@ -74,8 +74,8 @@ static int bpf_tcp_ingress(struct sock *sk, struct sk_psock *psock,
 
 	if (!ret) {
 		msg->sg.start = i;
-		sk_psock_queue_msg(psock, tmp);
-		sk_psock_data_ready(sk, psock);
+		sk_psock_queue_msg(psock, tmp); /* 加入psock的ingress_msg接收队列 */
+		sk_psock_data_ready(sk, psock); /* 唤醒应用层接收 */
 	} else {
 		sk_msg_free(sk, tmp);
 		kfree(tmp);
@@ -167,8 +167,8 @@ int tcp_bpf_sendmsg_redir(struct sock *sk, bool ingress,
 	if (unlikely(!psock))
 		return -EPIPE;
 
-	ret = ingress ? bpf_tcp_ingress(sk, psock, msg, bytes, flags) :
-			tcp_bpf_push_locked(sk, msg, bytes, flags, false);
+	ret = ingress ? bpf_tcp_ingress(sk, psock, msg, bytes, flags) : /* 由sock接收 */
+			tcp_bpf_push_locked(sk, msg, bytes, flags, false); /* 由sock发送 */
 	sk_psock_put(sk, psock);
 	return ret;
 }
@@ -333,8 +333,11 @@ static int tcp_bpf_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
 		return 0;
 
 	psock = sk_psock_get(sk);
-	if (unlikely(!psock))
+	if (unlikely(!psock)) /* 无psock直接调用tcp_recvmsg */
 		return tcp_recvmsg(sk, msg, len, flags, addr_len);
+	/* 如果sk接收队列sk_receive_queue有数据但psock的接收队列ingress_msg为空
+	 * 那么调用tcp_recvmsg来接收sk_receive_queue.
+	 */
 	if (!skb_queue_empty(&sk->sk_receive_queue) &&
 	    sk_psock_queue_empty(psock)) {
 		sk_psock_put(sk, psock);
@@ -342,18 +345,21 @@ static int tcp_bpf_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
 	}
 	lock_sock(sk);
 msg_bytes_ready:
+	/* 从psock->ingress_msg获取数据接收到msg */
 	copied = sk_msg_recvmsg(sk, psock, msg, len, flags);
 	if (!copied) {
 		long timeo;
 		int data;
 
 		timeo = sock_rcvtimeo(sk, flags & MSG_DONTWAIT);
-		data = tcp_msg_wait_data(sk, psock, timeo);
+		data = tcp_msg_wait_data(sk, psock, timeo); /* 阻塞的话就等待数据 */
 		if (data) {
+			/* psock->ingress_msg接收队列非空则继续接收 */
 			if (!sk_psock_queue_empty(psock))
 				goto msg_bytes_ready;
 			release_sock(sk);
 			sk_psock_put(sk, psock);
+			/* 否则由tcp_recvmsg来接收sk_receive_queue */
 			return tcp_recvmsg(sk, msg, len, flags, addr_len);
 		}
 		copied = -EAGAIN;
@@ -374,6 +380,10 @@ static int tcp_bpf_send_verdict(struct sock *sk, struct sk_psock *psock,
 	int ret;
 
 more_data:
+	/* 需要调用msg_parser prog时会置为__SK_NONE
+	 * 如果使用了bpf_msg_apply_bytes(), 那么会对接下来apply_bytes大小的数据应用之前的msg_parser prog返回的结果
+	 * 所以不需要每次调用msg_parser prog
+	 */
 	if (psock->eval == __SK_NONE) {
 		/* Track delta in msg size to add/subtract it on SK_DROP from
 		 * returned to user copied size. This ensures user doesn't
@@ -381,48 +391,54 @@ more_data:
 		 * verdict.
 		 */
 		delta = msg->sg.size;
-		psock->eval = sk_psock_msg_verdict(sk, psock, msg);
+		psock->eval = sk_psock_msg_verdict(sk, psock, msg); /* 执行msg_parser prog */
 		delta -= msg->sg.size;
 	}
 
+	/* 如果在msg_parser prog中调用bpf_msg_cork_bytes()对msg设置了cork_bytes,
+	 * 表示msg的数据量太小, 不足以判断数据如何重定向,
+	 * 需要等待累计cork_bytes字节的数据才调用msg_parser prog再次判断(由tcp_bpf_sendmsg()跳过本函数).
+	 * 注意: 这里没有执行数据发送或重定向直接返回了, 也就是本次msg_parser prog结果是忽略的
+	 */
 	if (msg->cork_bytes &&
 	    msg->cork_bytes > msg->sg.size && !enospc) {
-		psock->cork_bytes = msg->cork_bytes - msg->sg.size;
-		if (!psock->cork) {
+		psock->cork_bytes = msg->cork_bytes - msg->sg.size; /* 将还需要累计的量赋值给psock */
+		if (!psock->cork) { /* 分配cork保存缓存的msg */
 			psock->cork = kzalloc(sizeof(*psock->cork),
 					      GFP_ATOMIC | __GFP_NOWARN);
 			if (!psock->cork)
 				return -ENOMEM;
 		}
 		memcpy(psock->cork, msg, sizeof(*msg));
-		return 0;
+		return 0; /* 直接返回了, 没有对数据进行发送 */
 	}
 
-	tosend = msg->sg.size;
+	tosend = msg->sg.size; /* 要发送的大小 */
+	/* 如果设置了apply_bytes(bpf_msg_apply_bytes()接口设置), 那么本次发送不能超过apply_bytes */
 	if (psock->apply_bytes && psock->apply_bytes < tosend)
 		tosend = psock->apply_bytes;
 	eval = __SK_NONE;
 
-	switch (psock->eval) {
-	case __SK_PASS:
+	switch (psock->eval) { /* 根据msg_parser prog返回结果处理 */
+	case __SK_PASS: /* 不进行重定向, 即按照原tcp发送即可 */
 		ret = tcp_bpf_push(sk, msg, tosend, flags, true);
 		if (unlikely(ret)) {
 			*copied -= sk_msg_free(sk, msg);
 			break;
 		}
-		sk_msg_apply_bytes(psock, tosend);
+		sk_msg_apply_bytes(psock, tosend); /* 更新apply_bytes */
 		break;
-	case __SK_REDIRECT:
+	case __SK_REDIRECT: /* 需要重定向到其他sock */
 		redir_ingress = psock->redir_ingress;
-		sk_redir = psock->sk_redir;
-		sk_msg_apply_bytes(psock, tosend);
-		if (!psock->apply_bytes) {
+		sk_redir = psock->sk_redir; /* 目的sock */
+		sk_msg_apply_bytes(psock, tosend); /* 更新apply_bytes */
+		if (!psock->apply_bytes) { /* apply_bytes发完了 */
 			/* Clean up before releasing the sock lock. */
 			eval = psock->eval;
-			psock->eval = __SK_NONE;
+			psock->eval = __SK_NONE; /* 需要调用msg_parser prog了 */
 			psock->sk_redir = NULL;
 		}
-		if (psock->cork) {
+		if (psock->cork) { /* 直接重定向后需要清空cork */
 			cork = true;
 			psock->cork = NULL;
 		}
@@ -430,6 +446,7 @@ more_data:
 		release_sock(sk);
 
 		origsize = msg->sg.size;
+		/* 重定向数据到sk_redir, 根据BPF_F_INGRESS标志由该sk接受或发送 */
 		ret = tcp_bpf_sendmsg_redir(sk_redir, redir_ingress,
 					    msg, tosend, flags);
 		sent = origsize - msg->sg.size;
@@ -451,7 +468,7 @@ more_data:
 			ret = 0;
 		}
 		break;
-	case __SK_DROP:
+	case __SK_DROP: /* 丢弃 */
 	default:
 		sk_msg_free_partial(sk, msg, tosend);
 		sk_msg_apply_bytes(psock, tosend);
@@ -460,9 +477,9 @@ more_data:
 	}
 
 	if (likely(!ret)) {
-		if (!psock->apply_bytes) {
-			psock->eval =  __SK_NONE;
-			if (psock->sk_redir) {
+		if (!psock->apply_bytes) { /* 当apply_bytes发完后才需要再次调用msg_parser */
+			psock->eval =  __SK_NONE; /* 再次调用msg_parser prog */
+			if (psock->sk_redir) { /* 清除重定向sock */
 				sock_put(psock->sk_redir);
 				psock->sk_redir = NULL;
 			}
@@ -472,7 +489,7 @@ more_data:
 		    msg->sg.data[msg->sg.start].length) {
 			if (eval == __SK_REDIRECT)
 				sk_mem_charge(sk, tosend - sent);
-			goto more_data;
+			goto more_data; /* 还有数据, 继续执行 */
 		}
 	}
 	return ret;
@@ -490,13 +507,13 @@ static int tcp_bpf_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
 	flags = (msg->msg_flags & ~MSG_SENDPAGE_DECRYPTED);
 	flags |= MSG_NO_SHARED_FRAGS;
 
-	psock = sk_psock_get(sk);
+	psock = sk_psock_get(sk); /* 获取保存在sk->sk_user_data的psock */
 	if (unlikely(!psock))
 		return tcp_sendmsg(sk, msg, size);
 
 	lock_sock(sk);
 	timeo = sock_sndtimeo(sk, msg->msg_flags & MSG_DONTWAIT);
-	while (msg_data_left(msg)) {
+	while (msg_data_left(msg)) { /* 处理要发送的msg */
 		bool enospc = false;
 		u32 copy, osize;
 
@@ -506,9 +523,9 @@ static int tcp_bpf_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
 		}
 
 		copy = msg_data_left(msg);
-		if (!sk_stream_memory_free(sk))
+		if (!sk_stream_memory_free(sk)) /* 发送缓存满, 等待 */
 			goto wait_for_sndbuf;
-		if (psock->cork) {
+		if (psock->cork) { /* 如果设置了cork_bytes, 那么获取上次缓存的msg */
 			msg_tx = psock->cork;
 		} else {
 			msg_tx = &tmp;
@@ -532,18 +549,26 @@ static int tcp_bpf_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
 		}
 
 		copied += copy;
+		/* 如果设置了cork_bytes(bpf_msg_cork_bytes设置),
+		 * 需要等待累计cork_bytes字节的数据才调用msg_parser prog
+		 * 否则先掉到out_err返回等到下次sendmsg
+		 */
 		if (psock->cork_bytes) {
+			/* 更新下还需要等待的cork_bytes */
 			if (size > psock->cork_bytes)
 				psock->cork_bytes = 0;
 			else
 				psock->cork_bytes -= size;
+			/* 数据量还未达到(cork_bytes不为0), 直接返回, 也就是不调用msg_parser prog */
 			if (psock->cork_bytes && !enospc)
 				goto out_err;
 			/* All cork bytes are accounted, rerun the prog. */
+			/* 这里说明可以调用msg_parser prog了 */
 			psock->eval = __SK_NONE;
 			psock->cork_bytes = 0;
 		}
 
+		/* 核心函数, 执行msg_parser prog并根据结果重定向 */
 		err = tcp_bpf_send_verdict(sk, psock, msg_tx, &copied, flags);
 		if (unlikely(err < 0))
 			goto out_err;
@@ -587,14 +612,16 @@ static struct proto tcp_bpf_prots[TCP_BPF_NUM_PROTS][TCP_BPF_NUM_CFGS];
 static void tcp_bpf_rebuild_protos(struct proto prot[TCP_BPF_NUM_CFGS],
 				   struct proto *base)
 {
-	prot[TCP_BPF_BASE]			= *base;
+	/* stream_parser (BPF_PROG_TYPE_SK_SKB)使用, 主要修改接收接口 */
+	prot[TCP_BPF_BASE]			= *base; 		/* 先复制tcp_prot */
 	prot[TCP_BPF_BASE].destroy		= sock_map_destroy;
-	prot[TCP_BPF_BASE].close		= sock_map_close;
-	prot[TCP_BPF_BASE].recvmsg		= tcp_bpf_recvmsg;
+	prot[TCP_BPF_BASE].close		= sock_map_close;	/* 释放操作以及将sock从sockmap中删除 */
+	prot[TCP_BPF_BASE].recvmsg		= tcp_bpf_recvmsg; 	/* 从psock接收数据 */
 	prot[TCP_BPF_BASE].sock_is_readable	= sk_msg_is_readable;
 
-	prot[TCP_BPF_TX]			= prot[TCP_BPF_BASE];
-	prot[TCP_BPF_TX].sendmsg		= tcp_bpf_sendmsg;
+	/* msg_parser (BPF_PROG_TYPE_SK_MSG)使用, 在TCP_BPF_BASE基础上增加修改发送接口 */
+	prot[TCP_BPF_TX]			= prot[TCP_BPF_BASE];	/* 先复制上面的TCP_BPF_BASE */
+	prot[TCP_BPF_TX].sendmsg		= tcp_bpf_sendmsg;	/* 用于msg_parser处理发送重定向 */
 
 	prot[TCP_BPF_RX]			= prot[TCP_BPF_BASE];
 	prot[TCP_BPF_RX].recvmsg		= tcp_bpf_recvmsg_parser;
@@ -641,7 +668,7 @@ int tcp_bpf_update_proto(struct sock *sk, struct sk_psock *psock, bool restore)
 		config = (config == TCP_BPF_TX) ? TCP_BPF_TXRX : TCP_BPF_RX;
 	}
 
-	if (restore) {
+	if (restore) { /* 置1为恢复还原 */
 		if (inet_csk_has_ulp(sk)) {
 			/* TLS does not have an unhash proto in SW cases,
 			 * but we need to ensure we stop using the sock_map
@@ -653,6 +680,7 @@ int tcp_bpf_update_proto(struct sock *sk, struct sk_psock *psock, bool restore)
 		} else {
 			sk->sk_write_space = psock->saved_write_space;
 			/* Pairs with lockless read in sk_clone_lock() */
+			/* 将协议还原为tcp_prot */
 			sock_replace_proto(sk, psock->sk_proto);
 		}
 		return 0;
@@ -666,6 +694,9 @@ int tcp_bpf_update_proto(struct sock *sk, struct sk_psock *psock, bool restore)
 	}
 
 	/* Pairs with lockless read in sk_clone_lock() */
+	/* 将sk的协议替换成tcp_bpf_prots[family][config]
+	 * tcp_bpf_prots更改了tcp_prot的几个函数, 见tcp_bpf_rebuild_protos()
+	 */
 	sock_replace_proto(sk, &tcp_bpf_prots[family][config]);
 	return 0;
 }

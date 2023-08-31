@@ -388,6 +388,10 @@ struct tcp_sock {
 	u8	bpf_sock_ops_cb_flags;  /* Control calling BPF programs
 					 * values defined in uapi/linux/tcp.h
 					 */
+					/* 控制bpf事件回调是否调用, 默认不调用
+					 * 通过bpf_sock_ops_cb_flags_set()接口启用
+					 * 支持的回调类型详见BPF_SOCK_OPS_ALL_CB_FLAGS
+					 */
 	u8	bpf_chg_cc_inprogress:1; /* In the middle of
 					  * bpf_setsockopt(TCP_CONGESTION),
 					  * it is to avoid the bpf_tcp_cc->init()

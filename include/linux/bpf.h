@@ -232,7 +232,7 @@ struct bpf_map {
 	/* The first two cachelines with read-mostly members of which some
 	 * are also accessed in fast-path (e.g. ops, max_entries).
 	 */
-	const struct bpf_map_ops *ops ____cacheline_aligned;
+	const struct bpf_map_ops *ops ____cacheline_aligned; /* map类型操作函数, 由bpf_map_types数组维护 */
 	struct bpf_map *inner_map_meta;
 #ifdef CONFIG_SECURITY
 	void *security;

@@ -2570,6 +2570,11 @@ static const struct bpf_func_proto bpf_redirect_neigh_proto = {
 	.arg4_type	= ARG_ANYTHING,
 };
 
+/* 设置需要应用同一个重定向结果的字节数,
+ * 比如发送一个大文件时, 只需要一开始的数据就能决定重定向的目的sock,
+ * 那么msg_parser prog中就可以调用bpf_msg_apply_bytes()设置应用同一结果的字节数,
+ * 这样发完该大小的数据后才会再次调用msg_parser prog, 减少频繁调用prog的消耗
+ */
 BPF_CALL_2(bpf_msg_apply_bytes, struct sk_msg *, msg, u32, bytes)
 {
 	msg->apply_bytes = bytes;
@@ -2584,6 +2589,12 @@ static const struct bpf_func_proto bpf_msg_apply_bytes_proto = {
 	.arg2_type      = ARG_ANYTHING,
 };
 
+/* 设置需要等待累计cork_bytes字节的数据才调用msg_parser prog
+ * 比如需要用来确定重定向的数据可能跨越多次的sendmsg(),
+ * 那么就可以使用该接口通知psock达到cork_bytes数据量再调用msg_parser prog进行判断.
+ * 注意: 当调用时提供的msg数据长度达不到cork_bytes时(比如首次还是需要调用msg_parser prog),
+ * 	 msg_parser prog结果是忽略的, 也就是数据不会被发送而是缓存累计起来等到足量.
+ */
 BPF_CALL_2(bpf_msg_cork_bytes, struct sk_msg *, msg, u32, bytes)
 {
 	msg->cork_bytes = bytes;
@@ -2598,6 +2609,7 @@ static const struct bpf_func_proto bpf_msg_cork_bytes_proto = {
 	.arg2_type      = ARG_ANYTHING,
 };
 
+/* 将start到end数据线性化 */
 BPF_CALL_4(bpf_msg_pull_data, struct sk_msg *, msg, u32, start,
 	   u32, end, u64, flags)
 {
@@ -2611,6 +2623,7 @@ BPF_CALL_4(bpf_msg_pull_data, struct sk_msg *, msg, u32, start,
 		return -EINVAL;
 
 	/* First find the starting scatterlist element */
+	/* 找到start对应的scatterlist(找到i) */
 	i = msg->sg.start;
 	do {
 		offset += len;
@@ -2623,13 +2636,25 @@ BPF_CALL_4(bpf_msg_pull_data, struct sk_msg *, msg, u32, start,
 	if (unlikely(start >= offset + len))
 		return -EINVAL;
 
-	first_sge = i;
+	first_sge = i; /* 线性化的起始的scatterlist, 也就是start对应的scatterlist */
 	/* The start may point into the sg element so we need to also
 	 * account for the headroom.
 	 */
+	/* 此时的offset为start对应的scatterlist 前面所有的数据量,
+	 * len为start对应的scatterlist 的数据量
+	 */
 	bytes_sg_total = start - offset + bytes;
+	/* bytes_sg_total <= len说明所需的end-start数据都在同一个scatterlist中,
+	 * 本就是线性化的, 直接返回对应地址即可
+	 */
 	if (!test_bit(i, msg->sg.copy) && bytes_sg_total <= len)
 		goto out;
+
+	/* 以下就需要做线性化操作了, 流程是:
+	 * 申请新的page, 将start到end之间所有scatterlist的数据复制过去,
+	 * 然后用新的page取代start对应的scatterlist, 清空其他被合并的scatterlist,
+	 * 最终的结果就是start到end之间(包括)的scatterlist被合并成一个, 实现线性化
+	 */
 
 	/* At this point we need to linearize multiple scatterlist
 	 * elements or a single shared page. Either way we need to
@@ -2641,22 +2666,24 @@ BPF_CALL_4(bpf_msg_pull_data, struct sk_msg *, msg, u32, start,
 	 * of sg_entry slots. The downside is reading a single byte
 	 * will copy the entire sg entry.
 	 */
+	/* 计算copy: 从start起需要拷贝的scatterlist的数据量 */
 	do {
 		copy += sk_msg_elem(msg, i)->length;
 		sk_msg_iter_var_next(i);
 		if (bytes_sg_total <= copy)
 			break;
 	} while (i != msg->sg.end);
-	last_sge = i;
+	last_sge = i; /* 需要线性化的最后的scatterlist, 也就是end对应的scatterlist */
 
-	if (unlikely(bytes_sg_total > copy))
+	if (unlikely(bytes_sg_total > copy)) /* 数据量不够, 错误 */
 		return -EINVAL;
 
 	page = alloc_pages(__GFP_NOWARN | GFP_ATOMIC | __GFP_COMP,
-			   get_order(copy));
+			   get_order(copy)); /* 申请copy的内存页 */
 	if (unlikely(!page))
 		return -ENOMEM;
 
+	/* 这个循环将start到end范围内的所有scatterlist的数据拷贝到page中, 并对scatterlist做释放 */
 	raw = page_address(page);
 	i = first_sge;
 	do {
@@ -2673,6 +2700,9 @@ BPF_CALL_4(bpf_msg_pull_data, struct sk_msg *, msg, u32, start,
 		sk_msg_iter_var_next(i);
 	} while (i != last_sge);
 
+	/* 将线性化后的数据page替换掉first_sge,
+	 * 也就是实际上将first_sge到last_sge的范围内都数据都合并到first_sge中
+	 */
 	sg_set_page(&msg->sg.data[first_sge], page, copy, 0);
 
 	/* To repair sg ring we need to shift entries. If we only
@@ -2686,6 +2716,7 @@ BPF_CALL_4(bpf_msg_pull_data, struct sk_msg *, msg, u32, start,
 	if (!shift)
 		goto out;
 
+	/* 这个循环对被合并的(first_sge, last_sge]的scatterlist做清零处理 */
 	i = first_sge;
 	sk_msg_iter_var_next(i);
 	do {
@@ -2709,8 +2740,8 @@ BPF_CALL_4(bpf_msg_pull_data, struct sk_msg *, msg, u32, start,
 		      msg->sg.end - shift + NR_MSG_FRAG_IDS :
 		      msg->sg.end - shift;
 out:
-	msg->data = sg_virt(&msg->sg.data[first_sge]) + start - offset;
-	msg->data_end = msg->data + bytes;
+	msg->data = sg_virt(&msg->sg.data[first_sge]) + start - offset; /* data为start的虚拟地址 */
+	msg->data_end = msg->data + bytes; /* data_end为end的虚拟地址 */
 	return 0;
 }
 
@@ -2739,6 +2770,7 @@ BPF_CALL_4(bpf_msg_push_data, struct sk_msg *, msg, u32, start,
 		return 0;
 
 	/* First find the starting scatterlist element */
+	/* 找到start对应的scatterlist(找到i) */
 	i = msg->sg.start;
 	do {
 		offset += l;
@@ -2752,6 +2784,7 @@ BPF_CALL_4(bpf_msg_push_data, struct sk_msg *, msg, u32, start,
 	if (start >= offset + l)
 		return -EINVAL;
 
+	/* 空的scatterlist个数 */
 	space = MAX_MSG_FRAGS - sk_msg_elem_used(msg);
 
 	/* If no space available will fallback to copy, we need at
@@ -5630,6 +5663,9 @@ BPF_CALL_2(bpf_sock_ops_cb_flags_set, struct bpf_sock_ops_kern *, bpf_sock,
 
 	tcp_sk(sk)->bpf_sock_ops_cb_flags = val;
 
+	/* 返回设置的该内核不支持的flags, 比如用在低版本内核中
+	 * 正常就是返回0
+	 */
 	return argval & (~BPF_SOCK_OPS_ALL_CB_FLAGS);
 }
 
