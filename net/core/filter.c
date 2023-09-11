@@ -6844,6 +6844,10 @@ static const struct bpf_func_proto bpf_tc_sk_lookup_udp_proto = {
 	.arg5_type	= ARG_ANYTHING,
 };
 
+/* 释放sk的引用值
+ * 另外对于使用RCU释放的sock来说(TCP的listen), 获取的时候是不需要增加引用值的
+ * 所以这里释放的时候也不需要减少
+ */
 BPF_CALL_1(bpf_sk_release, struct sock *, sk)
 {
 	if (sk && sk_is_refcounted(sk))
@@ -11350,6 +11354,7 @@ BPF_CALL_3(bpf_sk_lookup_assign, struct bpf_sk_lookup_kern *, ctx,
 	if (unlikely(flags & ~(BPF_SK_LOOKUP_F_REPLACE |
 			       BPF_SK_LOOKUP_F_NO_REUSEPORT)))
 		return -EINVAL;
+	/* 只有TCP的listen和UDP非connected的socket可以被选择 */
 	if (unlikely(sk && sk_is_refcounted(sk)))
 		return -ESOCKTNOSUPPORT; /* reject non-RCU freed sockets */
 	if (unlikely(sk && sk_is_tcp(sk) && sk->sk_state != TCP_LISTEN))
@@ -11360,15 +11365,17 @@ BPF_CALL_3(bpf_sk_lookup_assign, struct bpf_sk_lookup_kern *, ctx,
 	/* Check if socket is suitable for packet L3/L4 protocol */
 	if (sk && sk->sk_protocol != ctx->protocol)
 		return -EPROTOTYPE;
+	/* v6的sock可以兼容v4 bpf中v4协议，除非sock指定了ipv6_only */
 	if (sk && sk->sk_family != ctx->family &&
 	    (sk->sk_family == AF_INET || ipv6_only_sock(sk)))
 		return -EAFNOSUPPORT;
 
+	/* 其他prog已经选择了sock, 需要指定BPF_SK_LOOKUP_F_REPLACE才能覆盖 */
 	if (ctx->selected_sk && !(flags & BPF_SK_LOOKUP_F_REPLACE))
 		return -EEXIST;
 
 	/* Select socket as lookup result */
-	ctx->selected_sk = sk;
+	ctx->selected_sk = sk; /* 设置选择的sock */
 	ctx->no_reuseport = flags & BPF_SK_LOOKUP_F_NO_REUSEPORT;
 	return 0;
 }

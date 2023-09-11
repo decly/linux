@@ -5987,7 +5987,13 @@ enum {
 
 /* BPF_FUNC_sk_assign flags in bpf_sk_lookup context. */
 enum {
+	/* 可以覆盖之前(比如其他的prog已经选择了)选择的sock,
+	 * 没指定的话如果其他prog已经选择sock了就会返回-EEXIST错误
+	 */
 	BPF_SK_LOOKUP_F_REPLACE		= (1ULL << 0),
+	/* 跳过reuseport的选择sk流程
+	 * 没指定的话如果选择的sk开启了resueport则还会经过reuseport组内sock的选择
+	 */
 	BPF_SK_LOOKUP_F_NO_REUSEPORT	= (1ULL << 1),
 };
 

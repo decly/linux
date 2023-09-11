@@ -114,11 +114,14 @@ int redir_port(struct bpf_sk_lookup *ctx)
 	if (ctx->local_port != DST_PORT)
 		return SK_PASS;
 
+	/* lookup操作会增加sock的引用值, 所以后面需要调用bpf_sk_release来释放引用值 */
 	sk = bpf_map_lookup_elem(&redir_map, &KEY_SERVER_A);
 	if (!sk)
 		return SK_PASS;
 
+	/* 这里选择sk */
 	err = bpf_sk_assign(ctx, sk, 0);
+	/* 释放sockmap的lookup操作增加的引用值 */
 	bpf_sk_release(sk);
 	return err ? SK_DROP : SK_PASS;
 }

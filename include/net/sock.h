@@ -2814,6 +2814,9 @@ static inline bool
 sk_is_refcounted(struct sock *sk)
 {
 	/* Only full sockets have sk->sk_flags. */
+	/* 这里排除掉设置了SOCK_RCU_FREE标志的(比如TCP的listen sk),
+	 * 因为使用了RCU释放, 所以获取的时候不需要增加其引用值
+	 */
 	return !sk_fullsock(sk) || !sock_flag(sk, SOCK_RCU_FREE);
 }
 

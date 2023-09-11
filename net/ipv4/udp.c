@@ -477,11 +477,15 @@ static struct sock *udp4_lookup_run_bpf(struct net *net,
 	if (udptable != net->ipv4.udp_table)
 		return NULL; /* only UDP is supported */
 
+	/* 这里调用bpf sk_lookup选择sk的函数(与tcp一样, 详见inet_lookup_run_bpf() */
 	no_reuseport = bpf_sk_lookup_run_v4(net, IPPROTO_UDP, saddr, sport,
 					    daddr, hnum, dif, &sk);
 	if (no_reuseport || IS_ERR_OR_NULL(sk))
 		return sk;
 
+	/* 如果选择的sk开启了reuseport, 那么再经过使用reuseport的结果
+	 * 除非bpf_sk_assign()指定了BPF_SK_LOOKUP_F_NO_REUSEPORT标志(即这里的no_reuseport)
+	 */
 	reuse_sk = lookup_reuseport(net, sk, skb, saddr, sport, daddr, hnum);
 	if (reuse_sk)
 		sk = reuse_sk;
@@ -505,16 +509,20 @@ struct sock *__udp4_lib_lookup(struct net *net, __be32 saddr,
 	hslot2 = &udptable->hash2[slot2];
 
 	/* Lookup connected or non-wildcard socket */
+	/* 先查找connect以及绑定具体地址的sk */
 	result = udp4_lib_lookup2(net, saddr, sport,
 				  daddr, hnum, dif, sdif,
 				  hslot2, skb);
+	/* 如果找到了connect(ESTABLISHED)的sk, 则直接选择. 因为bpf sk_lookup不支持connect的sk */
 	if (!IS_ERR_OR_NULL(result) && result->sk_state == TCP_ESTABLISHED)
 		goto done;
 
 	/* Lookup redirect from BPF */
+	/* 这里为bpf sk_lookup选择sk */
 	if (static_branch_unlikely(&bpf_sk_lookup_enabled)) {
 		sk = udp4_lookup_run_bpf(net, udptable, skb,
 					 saddr, sport, daddr, hnum, dif);
+		/* bpf选择了sk或者SK_DROP则直接返回 */
 		if (sk) {
 			result = sk;
 			goto done;
@@ -526,6 +534,7 @@ struct sock *__udp4_lib_lookup(struct net *net, __be32 saddr,
 		goto done;
 
 	/* Lookup wildcard sockets */
+	/* 最后再查找绑定0地址的sk */
 	hash2 = ipv4_portaddr_hash(net, htonl(INADDR_ANY), hnum);
 	slot2 = hash2 & udptable->mask;
 	hslot2 = &udptable->hash2[slot2];

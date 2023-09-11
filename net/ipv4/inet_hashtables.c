@@ -394,11 +394,22 @@ static inline struct sock *inet_lookup_run_bpf(struct net *net,
 	if (hashinfo != net->ipv4.tcp_death_row.hashinfo)
 		return NULL; /* only TCP is supported */
 
+	/* 这里调用bpf sk_lookup选择sk的函数
+	 * 多个prog按照attach的顺序执行，选择sock按照以下规律：
+	 * - prog中如果返回SK_PASS并且选择一个sock, 则认为该prog选择了sock
+	 * - 如果有多个prog都返回SK_PASS并且选择sock, 那么最后一个prog作为结果
+	 * - 如果有prog返回SK_DROP, 只有在其他prog都没有"返回SK_PASS且选择sock"时才认为选择失败
+	 *   返回-ECONNREFUSED(不再查找内核连接表, 相当于找不到连接然后回复reset)
+	 * - 如果所有prog都返回SK_PASS但是没有sock被选择, 那么继续按照内核默认的链接哈希表选择
+	 */
 	no_reuseport = bpf_sk_lookup_run_v4(net, IPPROTO_TCP, saddr, sport,
 					    daddr, hnum, dif, &sk);
 	if (no_reuseport || IS_ERR_OR_NULL(sk))
 		return sk;
 
+	/* 如果选择的sk开启了reuseport, 那么再经过使用reuseport的结果
+	 * 除非bpf_sk_assign()指定了BPF_SK_LOOKUP_F_NO_REUSEPORT标志(即这里的no_reuseport)
+	 */
 	reuse_sk = lookup_reuseport(net, sk, skb, doff, saddr, sport, daddr, hnum);
 	if (reuse_sk)
 		sk = reuse_sk;
@@ -417,9 +428,15 @@ struct sock *__inet_lookup_listener(struct net *net,
 	unsigned int hash2;
 
 	/* Lookup redirect from BPF */
+	/* 使用bpf sk_lookup查找sock, 当prog attach到netns中会被开启(NETNS_BPF_SK_LOOKUP) */
 	if (static_branch_unlikely(&bpf_sk_lookup_enabled)) {
 		result = inet_lookup_run_bpf(net, hashinfo, skb, doff,
 					     saddr, sport, daddr, hnum, dif);
+		/* 返回result有3种情况:
+		 * - prog选择了sock, 直接按照该sock返回
+		 * - prog返回了错误, 比如SK_DROP, 那么也直接返回错误不再选择sock
+		 * - prog返回NULL, 那么接着按照默认流程选择sock
+		 */
 		if (result)
 			goto done;
 	}

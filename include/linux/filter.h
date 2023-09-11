@@ -1366,9 +1366,9 @@ struct bpf_sk_lookup_kern {
 		const struct in6_addr *saddr;
 		const struct in6_addr *daddr;
 	} v6;
-	struct sock	*selected_sk;
+	struct sock	*selected_sk; /* 这里为选择的sock, bpf_sk_assign需要返回SK_PASS才有效 */
 	u32		ingress_ifindex;
-	bool		no_reuseport;
+	bool		no_reuseport; /* 是否指定BPF_SK_LOOKUP_F_NO_REUSEPORT */
 };
 
 extern struct static_key_false bpf_sk_lookup_enabled;
@@ -1437,6 +1437,7 @@ static inline bool bpf_sk_lookup_run_v4(struct net *net, int protocol,
 	bool no_reuseport = false;
 
 	rcu_read_lock();
+	/* 从netns中获取bpf sk_lookup的prog */
 	run_array = rcu_dereference(net->bpf.run_array[NETNS_BPF_SK_LOOKUP]);
 	if (run_array) {
 		struct bpf_sk_lookup_kern ctx = {
@@ -1452,9 +1453,15 @@ static inline bool bpf_sk_lookup_run_v4(struct net *net, int protocol,
 
 		act = BPF_PROG_SK_LOOKUP_RUN_ARRAY(run_array, ctx, bpf_prog_run);
 		if (act == SK_PASS) {
+			/* prog中SK_PASS选择的sk, 如果有多个则取最后一个 */
 			selected_sk = ctx.selected_sk;
+ 			/* 即bpf_sk_assign()指定flags的BPF_SK_LOOKUP_F_NO_REUSEPORT */
 			no_reuseport = ctx.no_reuseport;
 		} else {
+			/* SK_DROP(所有prog都没有选择sock并且存在prog返回SK_DROP)则返回错误,
+			 * 会使得__inet_lookup_listener()中直接跳过查找,
+			 * 所以相当于找不到sock会导致回复reset
+			 */
 			selected_sk = ERR_PTR(-ECONNREFUSED);
 		}
 	}
