@@ -210,6 +210,9 @@ static int __strp_recv(read_descriptor_t *desc, struct sk_buff *orig_skb,
 		if (!stm->strp.full_len) {
 			ssize_t len;
 
+			/* 这里执行上层回调parse_msg
+			 * 对psock来说是sk_psock_strp_parse()
+			 */
 			len = (*strp->cb.parse_msg)(strp, head);
 
 			if (!len) {
@@ -297,6 +300,9 @@ static int __strp_recv(read_descriptor_t *desc, struct sk_buff *orig_skb,
 		strp->need_bytes = 0;
 		STRP_STATS_INCR(strp->stats.msgs);
 
+		/* 这里把skb交给上层
+		 * 对psock来说调用sk_psock_strp_read()
+		 */
 		/* Give skb to upper layer */
 		strp->cb.rcv_msg(strp, head);
 
@@ -355,6 +361,9 @@ static int strp_read_sock(struct strparser *strp)
 	desc.count = 1; /* give more than one skb per call */
 
 	/* sk should be locked here, so okay to do read_sock */
+	/* tcp调用tcp_read_sock()
+	 * 主要就是读取sk_receive_queue中skb, 然后调用strp_recv()处理
+	 */
 	sock->ops->read_sock(strp->sk, &desc, strp_recv);
 
 	desc.error = strp->cb.read_sock_done(strp, desc.error);

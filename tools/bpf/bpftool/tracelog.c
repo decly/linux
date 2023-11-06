@@ -69,10 +69,12 @@ static bool get_tracefs_pipe(char *mnt)
 	bool found = false;
 	FILE *fp;
 
+	/* 1.先从known_mnts列出的默认路径看是否挂载了tracefs(通过判断statfs->f_type == TRACEFS_MAGIC) */
 	for (ptr = known_mnts; ptr < known_mnts + ARRAY_SIZE(known_mnts); ptr++)
 		if (find_tracefs_mnt_single(TRACEFS_MAGIC, mnt, *ptr))
 			goto exit_found;
 
+	/* 2.以上known_mnts找不到的话则从/proc/mounts中查找tracefs的挂载点 */
 	fp = fopen("/proc/mounts", "r");
 	if (!fp)
 		return false;
@@ -81,7 +83,7 @@ static bool get_tracefs_pipe(char *mnt)
 	snprintf(format, sizeof(format), "%%*s %%%zds %%99s %%*s %%*d %%*d\\n",
 		 PATH_MAX - strlen(pipe_name) - 1);
 	while (fscanf(fp, format, mnt, type) == 2)
-		if (strcmp(type, fstype) == 0) {
+		if (strcmp(type, fstype) == 0) { /* 第三列type字段为"tracefs"则找到 */
 			found = true;
 			break;
 		}
@@ -91,7 +93,8 @@ static bool get_tracefs_pipe(char *mnt)
 	if (found && validate_tracefs_mnt(mnt, TRACEFS_MAGIC))
 		goto exit_found;
 
-	if (block_mount)
+	/* 3.这里说明没挂载tracefs, 那么尝试挂载(除非指定了-n选项不挂载) */
+	if (block_mount) /* 指定-n选项直接返回错误 */
 		return false;
 
 	p_info("could not find tracefs, attempting to mount it now");
@@ -99,6 +102,10 @@ static bool get_tracefs_pipe(char *mnt)
 	 * /sys/kernel/debug/tracing when we try to access it. If we could not
 	 * find it, it is likely that debugfs is not mounted. Let's give one
 	 * attempt at mounting just tracefs at /sys/kernel/tracing.
+	 */
+	/* 这里将tracefs挂载在/sys/kernel/tracing中,
+	 * 因为tracefs一般会自动挂载在debugfs中(/sys/kernel/debug/tracing),
+	 * 上面找不到所以说明debugfs没挂载
 	 */
 	strcpy(mnt, known_mnts[1]);
 	if (mount_tracefs(mnt))
@@ -133,6 +140,9 @@ int do_tracelog(int argc, char **argv)
 	if (json_output)
 		jsonw_start_array(json_wtr);
 
+ 	/* 获取tracefs中trace_pipe的路径,
+	 * 默认是/sys/kernel/debug/tracing/trace_pipe
+	 */
 	if (!get_tracefs_pipe(trace_pipe))
 		return -1;
 
@@ -145,7 +155,7 @@ int do_tracelog(int argc, char **argv)
 	sigaction(SIGHUP, &act, NULL);
 	sigaction(SIGINT, &act, NULL);
 	sigaction(SIGTERM, &act, NULL);
-	while (1) {
+	while (1) { /* 输出trace_pipe内容 */
 		ssize_t ret;
 
 		ret = getline(&buff, &buff_len, trace_pipe_fd);

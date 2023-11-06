@@ -531,7 +531,7 @@ static void print_prog_plain(struct bpf_prog_info *info, int fd)
 {
 	char *memlock;
 
-	print_prog_header_plain(info, fd);
+	print_prog_header_plain(info, fd); /* 打印第一行 */
 
 	if (info->load_time) {
 		char buf[32];
@@ -557,6 +557,10 @@ static void print_prog_plain(struct bpf_prog_info *info, int fd)
 	if (info->nr_map_ids)
 		show_prog_maps(fd, info->nr_map_ids);
 
+	/* 打印pinned的路径(指定-f选项):
+	 * 之前build_pinned_obj_table()已经把bpf文件系统里的所有pin文件保存在prog_table里了,
+	 * 这里遍历比较id相等即为同一个prog, 然后打印pinned的路径
+	 */
 	if (!hashmap__empty(prog_table)) {
 		struct hashmap_entry *entry;
 
@@ -580,7 +584,7 @@ static int show_prog(int fd)
 	__u32 len = sizeof(info);
 	int err;
 
-	err = bpf_prog_get_info_by_fd(fd, &info, &len);
+	err = bpf_prog_get_info_by_fd(fd, &info, &len); /* 获取信息保存在info中 */
 	if (err) {
 		p_err("can't get prog info: %s", strerror(errno));
 		return -1;
@@ -589,7 +593,7 @@ static int show_prog(int fd)
 	if (json_output)
 		print_prog_json(&info, fd);
 	else
-		print_prog_plain(&info, fd);
+		print_prog_plain(&info, fd); /* 打印显示 */
 
 	return 0;
 }
@@ -605,6 +609,10 @@ static int do_show_subset(int argc, char **argv)
 		p_err("mem alloc failed");
 		return -1;
 	}
+	/* 通过id/name/tag/pinned查找prod返回fd, 因为name相同可能有多个prog, 所以是个数组
+	 * 还有一点是通过id和pinned是可以直接找到prog的,
+	 * 但是通过name和tag只能遍历所有prog再去匹配找到prog
+	 */
 	nb_fds = prog_parse_fds(&argc, &argv, &fds);
 	if (nb_fds < 1)
 		goto exit_free;
@@ -612,7 +620,7 @@ static int do_show_subset(int argc, char **argv)
 	if (json_output && nb_fds > 1)
 		jsonw_start_array(json_wtr);	/* root array */
 	for (i = 0; i < nb_fds; i++) {
-		err = show_prog(fds[i]);
+		err = show_prog(fds[i]); /* 打印prog信息 */
 		if (err) {
 			for (; i < nb_fds; i++)
 				close(fds[i]);
@@ -634,6 +642,10 @@ static int do_show(int argc, char **argv)
 	int err;
 	int fd;
 
+	/* 如果需要打印pinned路径(指定了-f选项),
+	 * 那遍历mount的bpf文件系统内的所有pin文件, 然后保存在prog_table表里
+	 * 后面print_prog_plain()会通过逐一比较prog id来确认pinned
+	 */
 	if (show_pinned) {
 		prog_table = hashmap__new(hash_fn_for_key_as_id,
 					  equal_fn_for_key_as_id, NULL);
@@ -645,16 +657,16 @@ static int do_show(int argc, char **argv)
 	}
 	build_obj_refs_table(&refs_table, BPF_OBJ_PROG);
 
-	if (argc == 2)
+	if (argc == 2) /* 通过name/tag/id/pinned指定了prog */
 		return do_show_subset(argc, argv);
 
-	if (argc)
+	if (argc) /* 打印所有prog, 带其他参数就错误 */
 		return BAD_ARG();
 
 	if (json_output)
 		jsonw_start_array(json_wtr);
-	while (true) {
-		err = bpf_prog_get_next_id(id, &id);
+	while (true) { /* 输出所有prog */
+		err = bpf_prog_get_next_id(id, &id); /* 从id=0开始遍历所有prog id */
 		if (err) {
 			if (errno == ENOENT) {
 				err = 0;
@@ -666,7 +678,7 @@ static int do_show(int argc, char **argv)
 			break;
 		}
 
-		fd = bpf_prog_get_fd_by_id(id);
+		fd = bpf_prog_get_fd_by_id(id); /* 得到对应prog的fd */
 		if (fd < 0) {
 			if (errno == ENOENT)
 				continue;
@@ -676,7 +688,7 @@ static int do_show(int argc, char **argv)
 			break;
 		}
 
-		err = show_prog(fd);
+		err = show_prog(fd); /* 获取prog信息打印 */
 		close(fd);
 		if (err)
 			break;
@@ -1032,12 +1044,14 @@ static int parse_attach_detach_args(int argc, char **argv, int *progfd,
 	if (!REQ_ARGS(3))
 		return -EINVAL;
 
+	/* 解析prog参数得到prog fd */
 	*progfd = prog_parse_fd(&argc, &argv);
 	if (*progfd < 0)
 		return *progfd;
 
+	/* 解析attch参数 */
 	*attach_type = parse_attach_type(*argv);
-	if (*attach_type == __MAX_BPF_ATTACH_TYPE) {
+	if (*attach_type == __MAX_BPF_ATTACH_TYPE) { /* 非法attach类型 */
 		p_err("invalid attach/detach type");
 		return -EINVAL;
 	}
@@ -1048,9 +1062,10 @@ static int parse_attach_detach_args(int argc, char **argv, int *progfd,
 	}
 
 	NEXT_ARG();
-	if (!REQ_ARGS(2))
+	if (!REQ_ARGS(2)) /* 还需要两个参数指定map */
 		return -EINVAL;
 
+	/* 解析map参数得到map fd */
 	*mapfd = map_parse_fd(&argc, &argv);
 	if (*mapfd < 0)
 		return *mapfd;
@@ -1064,11 +1079,13 @@ static int do_attach(int argc, char **argv)
 	int err, progfd;
 	int mapfd;
 
+	/* 解析参数PROG ATTACH_TYPE [MAP], 得到progfd, attach_type, mapfd */
 	err = parse_attach_detach_args(argc, argv,
 				       &progfd, &attach_type, &mapfd);
 	if (err)
 		return err;
 
+	/* 通过libbpf接口调用sys_bpf(BPF_PROG_ATTACH)将prog保存在map(sockmap/sockhash)中 */
 	err = bpf_prog_attach(progfd, mapfd, attach_type, 0);
 	if (err) {
 		p_err("failed prog attach to map");
@@ -1086,11 +1103,13 @@ static int do_detach(int argc, char **argv)
 	int err, progfd;
 	int mapfd;
 
+	/* 解析参数PROG ATTACH_TYPE [MAP], 得到progfd, attach_type, mapfd */
 	err = parse_attach_detach_args(argc, argv,
 				       &progfd, &attach_type, &mapfd);
 	if (err)
 		return err;
 
+	/* 通过libbpf接口调用sys_bpf(BPF_PROG_DETACH)将prog从map(sockmap/sockhash)中删除 */
 	err = bpf_prog_detach2(progfd, mapfd, attach_type);
 	if (err) {
 		p_err("failed prog detach from map");
@@ -1275,7 +1294,7 @@ static int do_run(int argc, char **argv)
 	if (!REQ_ARGS(4))
 		return -1;
 
-	fd = prog_parse_fd(&argc, &argv);
+	fd = prog_parse_fd(&argc, &argv); /* 根据参数找到prog返回fd */
 	if (fd < 0)
 		return -1;
 
@@ -1446,6 +1465,11 @@ get_prog_type_by_name(const char *name, enum bpf_prog_type *prog_type,
 	libbpf_print_fn_t print_backup;
 	int ret;
 
+	/* 根据section name(即bpf程序中定义的__section字段)确定prog类型和可attach的类型,
+	 * libbpf中定义了section_defs数组, 将prog类型和固定的section name对应起来,
+	 * (固定的section name就是bpftool prog help显示的TYPE那些类型)
+	 * 这样就可以通过section name遍历这个数组来确定prog的类型(只判断前缀一样即可)
+	 */
 	ret = libbpf_prog_type_by_name(name, prog_type, expected_attach_type);
 	if (!ret)
 		return ret;
@@ -1513,9 +1537,9 @@ static int load_with_options(int argc, char **argv, bool first_prog_only)
 		.relaxed_maps = relaxed_maps,
 	);
 	enum bpf_attach_type expected_attach_type;
-	struct map_replace *map_replace = NULL;
+	struct map_replace *map_replace = NULL; /* 需要代替的map列表 */
 	struct bpf_program *prog = NULL, *pos;
-	unsigned int old_map_fds = 0;
+	unsigned int old_map_fds = 0; /* map_replace中map的个数 */
 	const char *pinmaps = NULL;
 	__u32 xdpmeta_ifindex = 0;
 	__u32 offload_ifindex = 0;
@@ -1528,13 +1552,13 @@ static int load_with_options(int argc, char **argv, bool first_prog_only)
 	int idx, err;
 
 
-	if (!REQ_ARGS(2))
+	if (!REQ_ARGS(2)) /* 至少需要2个参数 */
 		return -1;
-	file = GET_ARG();
-	pinfile = GET_ARG();
+	file = GET_ARG(); /* bpf文件 */
+	pinfile = GET_ARG(); /* pin的路径 */
 
-	while (argc) {
-		if (is_prefix(*argv, "type")) {
+	while (argc) { /* 还指定了其他参数 */
+		if (is_prefix(*argv, "type")) { /* 显式指定了prog的type */
 			NEXT_ARG();
 
 			if (common_prog_type != BPF_PROG_TYPE_UNSPEC) {
@@ -1555,9 +1579,10 @@ static int load_with_options(int argc, char **argv, bool first_prog_only)
 					goto err_free_reuse_maps;
 				}
 				*type = 0;
-				strcat(type, *argv);
+				strcat(type, *argv); /* 参数指定的type */
 				strcat(type, "/");
 
+				/* 通过type类型获取实际的prog类型和可attach的类型 */
 				err = get_prog_type_by_name(type, &common_prog_type,
 							    &expected_attach_type);
 				free(type);
@@ -1566,16 +1591,27 @@ static int load_with_options(int argc, char **argv, bool first_prog_only)
 			}
 
 			NEXT_ARG();
-		} else if (is_prefix(*argv, "map")) {
+		} else if (is_prefix(*argv, "map")) { /* 指定需要复用的map(可以指定多次map),
+						       * 也就是bpf程序中定义的map用系统中已经存在的map代替,
+						       * 实现多个bpf程序共用一个map.
+						       * 比如bpf程序A和程序B都定义了map_x, 需要共享使用同一个map,
+						       * 程序B就可以在load时指定使用程序A的map_x来代替自己定义的map_x
+						       */
 			void *new_map_replace;
 			char *endptr, *name;
 			int fd;
 
 			NEXT_ARG();
 
+			/* 需要4个参数: { idx IDX | name NAME } MAP,
+			 * 其中MAP也是两个参数: { id MAP_ID | pinned FILE | name MAP_NAME }
+			 *
+			 * idx为该map在bpf程序中定义的索引(也就是第几个定义), 从0开始数
+			 */
 			if (!REQ_ARGS(4))
 				goto err_free_reuse_maps;
 
+			/* idx和name必须指定一个 */
 			if (is_prefix(*argv, "idx")) {
 				NEXT_ARG();
 
@@ -1597,10 +1633,12 @@ static int load_with_options(int argc, char **argv, bool first_prog_only)
 			}
 			NEXT_ARG();
 
+			/* 这里参数剩下两个来用来表示map, 查找map返回fd */
 			fd = map_parse_fd(&argc, &argv);
 			if (fd < 0)
 				goto err_free_reuse_maps;
 
+			/* 分配内存 */
 			new_map_replace = libbpf_reallocarray(map_replace,
 							      old_map_fds + 1,
 							      sizeof(*map_replace));
@@ -1613,7 +1651,7 @@ static int load_with_options(int argc, char **argv, bool first_prog_only)
 			map_replace[old_map_fds].idx = idx;
 			map_replace[old_map_fds].name = name;
 			map_replace[old_map_fds].fd = fd;
-			old_map_fds++;
+			old_map_fds++; /* map的个数加1 */
 		} else if (is_prefix(*argv, "dev")) {
 			p_info("Warning: 'bpftool prog load [...] dev <ifname>' syntax is deprecated.\n"
 			       "Going further, please use 'offload_dev <ifname>' to offload program to device.\n"
@@ -1660,7 +1698,9 @@ offload_dev:
 				goto err_free_reuse_maps;
 			}
 			NEXT_ARG();
-		} else if (is_prefix(*argv, "pinmaps")) {
+		} else if (is_prefix(*argv, "pinmaps")) { /* 指定了pinmaps的路径,
+							   * 会将所有map PIN到该路径下, 文件名为map name
+							   */
 			NEXT_ARG();
 
 			if (!REQ_ARGS(1))
@@ -1683,18 +1723,21 @@ offload_dev:
 		/* log_level1 + log_level2 + stats, but not stable UAPI */
 		open_opts.kernel_log_level = 1 + 2 + 4;
 
-	obj = bpf_object__open_file(file, &open_opts);
+	obj = bpf_object__open_file(file, &open_opts); /* 打开bpf文件解析 */
 	if (!obj) {
 		p_err("failed to open object file");
 		goto err_free_reuse_maps;
 	}
 
+	/* 循环所有的prog设置prog类型 */
 	bpf_object__for_each_program(pos, obj) {
 		enum bpf_prog_type prog_type = common_prog_type;
 
+		/* prog类型没有使用type指定, 通过section name来自动确定prog类型 */
 		if (prog_type == BPF_PROG_TYPE_UNSPEC) {
-			const char *sec_name = bpf_program__section_name(pos);
+			const char *sec_name = bpf_program__section_name(pos); /* 获取prog的section name */
 
+			/* 获取prog类型和可attach的类型 */
 			err = get_prog_type_by_name(sec_name, &prog_type,
 						    &expected_attach_type);
 			if (err < 0)
@@ -1712,18 +1755,22 @@ offload_dev:
 		bpf_program__set_expected_attach_type(pos, expected_attach_type);
 	}
 
+	/* 将指定的map按照idx排序 */
 	qsort(map_replace, old_map_fds, sizeof(*map_replace),
 	      map_replace_compar);
 
 	/* After the sort maps by name will be first on the list, because they
 	 * have idx == -1.  Resolve them.
 	 */
+	/* 如果map是使用name指定的(idx=-1), 经过上面qsort后会排到最前面,
+	 * 这里通过遍历bpf文件定义的map的name比较确定指定map的idx
+	 */
 	j = 0;
 	while (j < old_map_fds && map_replace[j].name) {
 		i = 0;
-		bpf_object__for_each_map(map, obj) {
+		bpf_object__for_each_map(map, obj) { /* 遍历bpf定义的所有map比较name */
 			if (!strcmp(bpf_map__name(map), map_replace[j].name)) {
-				map_replace[j].idx = i;
+				map_replace[j].idx = i; /* 找到了设置idx */
 				break;
 			}
 			i++;
@@ -1735,6 +1782,7 @@ offload_dev:
 		j++;
 	}
 	/* Resort if any names were resolved */
+	/* 现在所有map都有idx了, 再重新按照idx排序一遍 */
 	if (j)
 		qsort(map_replace, old_map_fds, sizeof(*map_replace),
 		      map_replace_compar);
@@ -1742,12 +1790,15 @@ offload_dev:
 	/* Set ifindex and name reuse */
 	j = 0;
 	idx = 0;
+	/* 这里对map_replace中的map使用bpf_map__reuse_fd来复用fd,
+	 * 这样后面bpf_object__load_xattr()时就不会重复创建map
+	 */
 	bpf_object__for_each_map(map, obj) {
 		if (bpf_map__type(map) != BPF_MAP_TYPE_PERF_EVENT_ARRAY)
 			bpf_map__set_ifindex(map, offload_ifindex);
 
 		if (j < old_map_fds && idx == map_replace[j].idx) {
-			err = bpf_map__reuse_fd(map, map_replace[j++].fd);
+			err = bpf_map__reuse_fd(map, map_replace[j++].fd); /* reuse fd */
 			if (err) {
 				p_err("unable to set up map reuse: %d", err);
 				goto err_close_obj;
@@ -1768,18 +1819,24 @@ offload_dev:
 		goto err_close_obj;
 	}
 
-	err = bpf_object__load(obj);
+	err = bpf_object__load(obj); /* 加载bpf程序 */
 	if (err) {
 		p_err("failed to load object file");
 		goto err_close_obj;
 	}
 
+	/* 检查pin路径是否为bpffs, 不是的话自动挂载bpffs (-n选项可关闭自动挂载) */
 	err = mount_bpffs_for_pin(pinfile, !first_prog_only);
 	if (err)
 		goto err_close_obj;
 
-	if (first_prog_only) {
-		prog = bpf_object__next_program(obj, NULL);
+	/* 指定first_prog_only(prog load)只PIN首个prog, 由于在bpftool执行完后只会保留被PIN的prog,
+	 * 所以相当于只load了首个prog.
+	 * 而不指定first_prog_only(prog loadall)的话把所有prog都PIN到bpffs中,
+	 * 也就相当于load了全部的prog.
+	 */
+	if (first_prog_only) { /* bpftool prog load只PIN首个prog, pinfile为pin文件路径 */
+		prog = bpf_object__next_program(obj, NULL); /* 首个prog */
 		if (!prog) {
 			p_err("object file doesn't contain any bpf program");
 			goto err_close_obj;
@@ -1788,13 +1845,13 @@ offload_dev:
 		if (auto_attach)
 			err = auto_attach_program(prog, pinfile);
 		else
-			err = bpf_obj_pin(bpf_program__fd(prog), pinfile);
+			err = bpf_obj_pin(bpf_program__fd(prog), pinfile); /* pin到指定路径 */
 		if (err) {
 			p_err("failed to pin program %s",
 			      bpf_program__section_name(prog));
 			goto err_close_obj;
 		}
-	} else {
+	} else { /* bpftool prog loadall PIN所有的prog, pinfile为目录路径, pin文件即为prog name */
 		if (auto_attach)
 			err = auto_attach_programs(obj, pinfile);
 		else
@@ -1805,7 +1862,7 @@ offload_dev:
 		}
 	}
 
-	if (pinmaps) {
+	if (pinmaps) { /* 指定了pinmaps的路径, 将所有map PIN到该路径下, PIN文件名为map name */
 		err = bpf_object__pin_maps(obj, pinmaps);
 		if (err) {
 			p_err("failed to pin all maps");
@@ -1939,9 +1996,9 @@ err_close_obj:
 
 static int do_load(int argc, char **argv)
 {
-	if (use_loader)
+	if (use_loader) /* -L|--use_loader选项 */
 		return do_loader(argc, argv);
-	return load_with_options(argc, argv, true);
+	return load_with_options(argc, argv, true); /* 常规方式load */
 }
 
 static int do_loadall(int argc, char **argv)

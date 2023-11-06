@@ -104,12 +104,29 @@ static inline u32 codel_time_to_us(codel_time_t val)
  *                         in the diffserv/ECN byte of the IP header
  * @ce_threshold_mask: mask to apply to ce_threshold_selector comparison
  */
-struct codel_params {
-	codel_time_t	target;
-	codel_time_t	ce_threshold;
-	codel_time_t	interval;
-	u32		mtu;
-	bool		ecn;
+struct codel_params { /* 参数结构体 */
+	codel_time_t	target;	/* skb延迟发送时间(enqueue到dequeue的时间差)
+				 * 超过target(默认5ms)则认为负载大.
+				 * tc参数target可设置.
+				 */
+	codel_time_t	ce_threshold; /* skb发送时如果延迟时间超过ce_threshold则标记CE,
+				       * 默认很大值(大概2147秒), 相当于关闭该功能
+				       * tc参数ce_threshold可设置.
+				       */
+	codel_time_t	interval; /* skb延迟发送时间超过target的持续时间超过interval(默认100ms)时, 该flow进入丢包状态,
+				   * 即认为该flow的skb一直处于持续延迟发送的状态;
+				   * 注意丢包状态是针对每个flow单独设置的, 不是整个qdisc;
+				   * 进入丢包状态后每一个丢包周期(动态)丢弃一个skb或设置CE标记(ecn参数开启, 默认),
+				   * 直到获取的skb延迟发送时间小于target才退出丢包状态.
+				   * tc参数interval可设置.
+				   */
+	u32		mtu;	/* 当qdisc缓存的数据包总大小不超过mtu时(默认为mtu大小, 即不超过1个数据包),
+				 * 就算延迟持续时间超过interval也不会进入丢包状态
+				 */
+	bool		ecn;	/* 是否开启ecn标记, 默认开启
+				 * 开启后在丢包状态(延迟持续时间超过interval)时标记CE标志而不丢包
+				 * tc参数[no]ecn可设置.
+				 */
 	u8		ce_threshold_selector;
 	u8		ce_threshold_mask;
 };
@@ -127,13 +144,13 @@ struct codel_params {
  * @ldelay:		sojourn time of last dequeued packet
  */
 struct codel_vars {
-	u32		count;
+	u32		count;		/* 本次进入丢包状态后丢包的数量 */
 	u32		lastcount;
-	bool		dropping;
+	bool		dropping;	/* 标记进入丢包状态 */
 	u16		rec_inv_sqrt;
-	codel_time_t	first_above_time;
-	codel_time_t	drop_next;
-	codel_time_t	ldelay;
+	codel_time_t	first_above_time; /* 用来辅助判断skb延迟持续时间超过阈值 */
+	codel_time_t	drop_next;	/* 表示一个丢包周期, 一个周期丢一个skb */
+	codel_time_t	ldelay;		/* skb延迟时间, 即enqueue到dequeue的时间差 */
 };
 
 #define REC_INV_SQRT_BITS (8 * sizeof(u16)) /* or sizeof_in_bits(rec_inv_sqrt) */
@@ -149,11 +166,11 @@ struct codel_vars {
  * @ce_mark:	number of packets CE marked because sojourn time was above ce_threshold
  */
 struct codel_stats {
-	u32		maxpacket;
+	u32		maxpacket;	/* 见过的最大skb的大小 */
 	u32		drop_count;
 	u32		drop_len;
-	u32		ecn_mark;
-	u32		ce_mark;
+	u32		ecn_mark;	/* 延迟发送后进入丢包状态 标记CE代替丢包的数据包个数 */
+	u32		ce_mark;	/* 发送延迟时间超过ce_threshold标记CE的数据包个数 */
 };
 
 #define CODEL_DISABLED_THRESHOLD INT_MAX

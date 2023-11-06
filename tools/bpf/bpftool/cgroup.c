@@ -526,7 +526,7 @@ static int do_attach(int argc, char **argv)
 		goto exit;
 	}
 
-	attach_type = parse_attach_type(argv[1]);
+	attach_type = parse_attach_type(argv[1]); /* 查找attach类型 */
 	if (attach_type == __MAX_BPF_ATTACH_TYPE) {
 		p_err("invalid attach type");
 		goto exit_cgroup;
@@ -534,7 +534,7 @@ static int do_attach(int argc, char **argv)
 
 	argc -= 2;
 	argv = &argv[2];
-	prog_fd = prog_parse_fd(&argc, &argv);
+	prog_fd = prog_parse_fd(&argc, &argv); /* 查找prog, 返回fd */
 	if (prog_fd < 0)
 		goto exit_cgroup;
 
@@ -549,6 +549,7 @@ static int do_attach(int argc, char **argv)
 		}
 	}
 
+	/* 这里调用libbpf:bpf_prog_attach, 通过BPF_PROG_ATTACH将prog attach到cgroup上 */
 	if (bpf_prog_attach(prog_fd, cgroup_fd, attach_type, attach_flags)) {
 		p_err("failed to attach program");
 		goto exit_prog;

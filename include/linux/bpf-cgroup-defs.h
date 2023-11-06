@@ -49,6 +49,9 @@ enum cgroup_bpf_attach_type {
 
 struct cgroup_bpf {
 	/* array of effective progs in this cgroup */
+	/* 实际会被调用的prog, 而下面的progs表是attach的prog. 
+	 * 比如sockops调用BPF_CGROUP_RUN_PROG_SOCK_OPS来执行prog是遍历effective中的prog
+	 */
 	struct bpf_prog_array __rcu *effective[MAX_CGROUP_BPF_ATTACH_TYPE];
 
 	/* attached progs to this cgroup and attach flags
@@ -56,8 +59,8 @@ struct cgroup_bpf {
 	 * have either zero or one element
 	 * when BPF_F_ALLOW_MULTI the list can have up to BPF_CGROUP_MAX_PROGS
 	 */
-	struct hlist_head progs[MAX_CGROUP_BPF_ATTACH_TYPE];
-	u8 flags[MAX_CGROUP_BPF_ATTACH_TYPE];
+	struct hlist_head progs[MAX_CGROUP_BPF_ATTACH_TYPE]; /* attach的prog表 */
+	u8 flags[MAX_CGROUP_BPF_ATTACH_TYPE]; /* 对应的BPF_F_ALLOW_OVERRIDE和BPF_F_ALLOW_MULTI标志 */
 
 	/* list of cgroup shared storages */
 	struct list_head storages;

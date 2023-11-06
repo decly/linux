@@ -51,7 +51,7 @@
 #include <net/tcp.h>
 
 struct fq_skb_cb {
-	u64	        time_to_send;
+	u64	        time_to_send;	/* skb要发送的时间 */
 };
 
 static inline struct fq_skb_cb *fq_skb_cb(struct sk_buff *skb)
@@ -65,27 +65,36 @@ static inline struct fq_skb_cb *fq_skb_cb(struct sk_buff *skb)
  * If packets have monotically increasing time_to_send, they are placed in O(1)
  * in linear list (head,tail), otherwise are placed in a rbtree (t_root).
  */
-struct fq_flow {
+struct fq_flow { /* 代表一个流 */
 /* First cache line : used in fq_gc(), fq_enqueue(), fq_dequeue() */
-	struct rb_root	t_root;
+	struct rb_root	t_root;		/* 存储skb的红黑树, 按照发送时间(time_to_send)排序 */
 	struct sk_buff	*head;		/* list of skbs for this flow : first skb */
+					/* 存储skb的fifo队列(包括下面的tail), 也是按照发送时间排序
+					 * 流中有两个skb队列, 一个fifo一个红黑树
+					 * 如果上层按照发送时间来发送, 那么只用到fifo, 否则同时使用
+					 * 详见skb加队列函数flow_queue_add()和取队列函数fq_peek()
+					 */
 	union {
 		struct sk_buff *tail;	/* last skb in the list */
 		unsigned long  age;	/* (jiffies | 1UL) when flow was emptied, for gc */
+					/* 标记流deteach(即idle)的开始时间 */
 	};
-	struct rb_node	fq_node;	/* anchor in fq_root[] trees */
-	struct sock	*sk;
+	struct rb_node	fq_node;	/* anchor in fq_root[] trees *//* 链入红黑树 */
+	struct sock	*sk;		/* 流对应的sock */
 	u32		socket_hash;	/* sk_hash */
 	int		qlen;		/* number of packets in flow queue */
 
 /* Second cache line, used in fq_dequeue() */
-	int		credit;
+	int		credit;		/* 流每次的发送配额, 单位为字节,
+					 * 每轮RR回补q->quantum(默认两个数据包大小)
+					 * 可用tc中的quantum参数配置
+					 */
 	/* 32bit hole on 64bit arches */
 
 	struct fq_flow *next;		/* next pointer in RR lists */
 
 	struct rb_node  rate_node;	/* anchor in q->delayed tree */
-	u64		time_next_packet;
+	u64		time_next_packet; /* 下个skb的发送时间, 也就是该流的最早发送时间 */
 } ____cacheline_aligned_in_smp;
 
 struct fq_flow_head {
@@ -94,32 +103,76 @@ struct fq_flow_head {
 };
 
 struct fq_sched_data {
-	struct fq_flow_head new_flows;
+	struct fq_flow_head new_flows;	/* 保存新加入的流, dequeue时先从new_flows中遍历流发送skb
+					 * 额度用完后加入到old_flows尾部
+					 */
 
-	struct fq_flow_head old_flows;
+	struct fq_flow_head old_flows;	/* 保存旧的流, dequeue遍历完new_flows后遍历old_flows发送skb
+					 * 额度用完后也是加入到old_flows尾部(RR)
+					 */
 
 	struct rb_root	delayed;	/* for rate limited flows */
-	u64		time_next_delayed_flow;
+					/* 保存发送时间还未到的流, 用来实现延迟发送
+					 * 按照fq_flow->time_next_packet排序
+					 */
+	u64		time_next_delayed_flow;	/* delayed中所有流的最早发送时间 */
 	u64		ktime_cache;	/* copy of last ktime_get_ns() */
-	unsigned long	unthrottle_latency_ns;
+	unsigned long	unthrottle_latency_ns;	/* 用来估算流发送的延迟时间, 按照7/8old +1/8new计算,只是统计 */
 
 	struct fq_flow	internal;	/* for non classified or high prio packets */
-	u32		quantum;
-	u32		initial_quantum;
-	u32		flow_refill_delay;
+					/* 优先队列单独一个, 优先的数据包放这个队列里优先发送 */
+	u32		quantum;	/* 流每次可发送配额, 默认为2个数据包大小,
+					 * 这个值可用来调整pacing的粒度
+					 * tc参数quantum可配置
+					 */
+	u32		initial_quantum; /* 流初始化发送配额, 默认为10个数据包大小
+					  * 可用来控制首RTT不参与pacing的数据包个数
+					  * tc参数initial_quantum可配置
+					  */
+	u32		flow_refill_delay; /* 流idle时间超过该值后才能补配额, 默认40ms
+					    * tc参数refill_delay可配置
+					    */
 	u32		flow_plimit;	/* max packets per flow */
+					/* 限制每个流缓存的数据包个数，超过后会丢弃
+					 * tc参数flow_limit可配置
+					 */
 	unsigned long	flow_max_rate;	/* optional max rate per flow */
-	u64		ce_threshold;
+					/* 设置最大发送速率pacing_rate, 单位B/S
+					 * tc参数maxrate可配置
+					 */
+	u64		ce_threshold;	/* skb发送时, 如果离skb本该发送的时间超过ce_threshold阈值,
+					 * 说明负载过高本地拥塞了, 那么就设置ECN标志.
+					 * 默认为4294秒
+					 * tc的ce_threshold参数可配置
+					 */
 	u64		horizon;	/* horizon in ns */
+					/* 上层设置skb的发送时间阈值(enqueue时的发送时间不能超过该值),
+					 * 默认10秒
+					 * tc的horizon参数可配置
+					 */
 	u32		orphan_mask;	/* mask for orphaned skb */
-	u32		low_rate_threshold;
-	struct rb_root	*fq_root;
+	u32		low_rate_threshold; /* 当pacing rate低于low_rate_threshold时(默认550Kbps)
+					     * 为了保证pacing的精度,不用每次发满配额. 这样可以保证
+					     * pacing更细化.
+					     * 550Kbps是个经验值, commit说在YouTube video上测试了两年
+					     * tc的low_rate_threshold参数可以配置
+					     */
+	struct rb_root	*fq_root;	/* 保存流的红黑树数组, 流结构为fq_flow
+					 * 默认有1024个红黑树(1<<fq_trees_log)
+					 * 这个红黑树保存了所有的流, 包括active和inactive流,
+					 * 目的是enqueue时用来通过skb查找流,
+					 * 而dequeue时是通过遍历new_flows和old_flows循环从流中获取skb发送的
+					 */
 	u8		rate_enable;
-	u8		fq_trees_log;
-	u8		horizon_drop;
-	u32		flows;
-	u32		inactive_flows;
-	u32		throttled_flows;
+	u8		fq_trees_log;	/* fq_root红黑树个数的对数, 默认10, 即1024个红黑树.
+					 * tc中的buckets参数可设置红黑树个数
+					 */
+	u8		horizon_drop;	/* 置1时若skb设置的发送时间超过horizon则直接丢弃, 否则时间置为horizon, 默认1
+					 * tc的horizon_{cap|drop}参数可配置
+					 */
+	u32		flows;		/* fq_root中全部流的个数 */
+	u32		inactive_flows; /* fq_root中无skb的流个数, 多了就触发流回收 */
+	u32		throttled_flows; /* delayed中流的个数 */
 
 	u64		stat_gc_flows;
 	u64		stat_internal_packets;
@@ -132,6 +185,12 @@ struct fq_sched_data {
 	u64		stat_allocation_errors;
 
 	u32		timer_slack; /* hrtimer slack in ns */
+					/* qdisc watchdog定时器的松弛范围, 默认10us
+					 * 当目前没有流需要立刻发送数据包时, 会激活定时器,
+					 * 时间为首个需要发送数据包的时间, 定时器并不是完全准时的,
+					 * 而timer_slack为定时器允许的松弛时间.
+					 * tc的timer_slack参数可配置
+					 */
 	struct qdisc_watchdog watchdog;
 };
 
@@ -152,6 +211,7 @@ static bool fq_flow_is_detached(const struct fq_flow *f)
 }
 
 /* special value to mark a throttled flow (not on old/new list) */
+/* throttled只是用来标记fq_flow被加入了delayed树, 实际没有用到 */
 static struct fq_flow throttled;
 
 static bool fq_flow_is_throttled(const struct fq_flow *f)
@@ -176,6 +236,7 @@ static void fq_flow_unset_throttled(struct fq_sched_data *q, struct fq_flow *f)
 	fq_flow_add_tail(&q->old_flows, f);
 }
 
+/* 将流fq_flow按下次发送时间排序(f->time_next_packet)加入delayed红黑树中 */
 static void fq_flow_set_throttled(struct fq_sched_data *q, struct fq_flow *f)
 {
 	struct rb_node **p = &q->delayed.rb_node, *parent = NULL;
@@ -195,7 +256,8 @@ static void fq_flow_set_throttled(struct fq_sched_data *q, struct fq_flow *f)
 	q->throttled_flows++;
 	q->stat_throttled++;
 
-	f->next = &throttled;
+	f->next = &throttled; /* 做个标记 */
+	/* 更新delayed树中最早发送时间 */
 	if (q->time_next_delayed_flow > f->time_next_packet)
 		q->time_next_delayed_flow = f->time_next_packet;
 }
@@ -232,8 +294,9 @@ static void fq_gc(struct fq_sched_data *q,
 		if (f->sk == sk)
 			break;
 
+		/* 空流超过3秒才可被回收, 一次最多回收8个 */
 		if (fq_gc_candidate(f)) {
-			tofree[fcnt++] = f;
+			tofree[fcnt++] = f; /* 先记录, 后面再一起回收 */
 			if (fcnt == FQ_GC_MAX)
 				break;
 		}
@@ -255,7 +318,7 @@ static void fq_gc(struct fq_sched_data *q,
 	q->inactive_flows -= fcnt;
 	q->stat_gc_flows += fcnt;
 
-	kmem_cache_free_bulk(fq_flow_cachep, fcnt, tofree);
+	kmem_cache_free_bulk(fq_flow_cachep, fcnt, tofree); /* 一起释放掉 */
 }
 
 static struct fq_flow *fq_classify(struct sk_buff *skb, struct fq_sched_data *q)
@@ -266,6 +329,7 @@ static struct fq_flow *fq_classify(struct sk_buff *skb, struct fq_sched_data *q)
 	struct fq_flow *f;
 
 	/* warning: no starvation prevention... */
+	/* 高优先级的包单独一个队列 */
 	if (unlikely((skb->priority & TC_PRIO_MAX) == TC_PRIO_CONTROL))
 		return &q->internal;
 
@@ -278,15 +342,16 @@ static struct fq_flow *fq_classify(struct sk_buff *skb, struct fq_sched_data *q)
 	 *    especially if the listener set SO_MAX_PACING_RATE
 	 * 4) We pretend they are orphaned
 	 */
-	if (!sk || sk_listener(sk)) {
+	if (!sk || sk_listener(sk)) { /* SYNACK不做pacing */
 		unsigned long hash = skb_get_hash(skb) & q->orphan_mask;
 
 		/* By forcing low order bit to 1, we make sure to not
 		 * collide with a local flow (socket pointers are word aligned)
 		 */
+		/* sk的地址用hash代替并置低位, 确保不会和真实sk地址冲突 */
 		sk = (struct sock *)((hash << 1) | 1UL);
-		skb_orphan(skb);
-	} else if (sk->sk_state == TCP_CLOSE) {
+		skb_orphan(skb); /* 先orphan掉, dequeue时就不会去获取sk->sk_pacing_rate */
+	} else if (sk->sk_state == TCP_CLOSE) { /* close状态还能发包的比如UDP */
 		unsigned long hash = skb_get_hash(skb) & q->orphan_mask;
 		/*
 		 * Sockets in TCP_CLOSE are non connected.
@@ -299,14 +364,17 @@ static struct fq_flow *fq_classify(struct sk_buff *skb, struct fq_sched_data *q)
 		sk = (struct sock *)((hash << 1) | 1UL);
 	}
 
+	/* 根据sk的地址哈希来获取红黑树 */
 	root = &q->fq_root[hash_ptr(sk, q->fq_trees_log)];
 
+	/* 空流个数超过一半触发流回收 */
 	if (q->flows >= (2U << q->fq_trees_log) &&
 	    q->inactive_flows > q->flows/2)
 		fq_gc(q, root, sk);
 
 	p = &root->rb_node;
 	parent = NULL;
+	/* 遍历红黑树, 查找流sk是否已经在红黑树中 */
 	while (*p) {
 		parent = *p;
 
@@ -316,6 +384,10 @@ static struct fq_flow *fq_classify(struct sk_buff *skb, struct fq_sched_data *q)
 			 * if its sk_hash is the same.
 			 * It not, we need to refill credit with
 			 * initial quantum
+			 */
+			/* 因为红黑树是按照sk地址保存的, 有可能sk被重新使用了,
+			 * 所以需要判断下sk_hash值是否一样, 不一样说明不是同一条流了,
+			 * 需要重新初始化fq_flow
 			 */
 			if (unlikely(skb->sk == sk &&
 				     f->socket_hash != sk->sk_hash)) {
@@ -328,7 +400,7 @@ static struct fq_flow *fq_classify(struct sk_buff *skb, struct fq_sched_data *q)
 					fq_flow_unset_throttled(q, f);
 				f->time_next_packet = 0ULL;
 			}
-			return f;
+			return f; /* 找到返回流fq_flow */
 		}
 		if (f->sk > sk)
 			p = &parent->rb_right;
@@ -336,8 +408,9 @@ static struct fq_flow *fq_classify(struct sk_buff *skb, struct fq_sched_data *q)
 			p = &parent->rb_left;
 	}
 
+	/* 新的流则分配一个fq_flow */
 	f = kmem_cache_zalloc(fq_flow_cachep, GFP_ATOMIC | __GFP_NOWARN);
-	if (unlikely(!f)) {
+	if (unlikely(!f)) { /* 分配失败先借用优先队列发送 */
 		q->stat_allocation_errors++;
 		return &q->internal;
 	}
@@ -347,12 +420,13 @@ static struct fq_flow *fq_classify(struct sk_buff *skb, struct fq_sched_data *q)
 	f->sk = sk;
 	if (skb->sk == sk) {
 		f->socket_hash = sk->sk_hash;
-		if (q->rate_enable)
+		if (q->rate_enable) /* 设置SK_PACING_FQ标志, 这样TCP层就不会用定时器来pacing */
 			smp_store_release(&sk->sk_pacing_status,
 					  SK_PACING_FQ);
 	}
-	f->credit = q->initial_quantum;
+	f->credit = q->initial_quantum; /* 初始化发送配额 */
 
+	/* 将fq_flow加入到红黑树 */
 	rb_link_node(&f->fq_node, parent, p);
 	rb_insert_color(&f->fq_node, root);
 
@@ -361,6 +435,12 @@ static struct fq_flow *fq_classify(struct sk_buff *skb, struct fq_sched_data *q)
 	return f;
 }
 
+/* 获取流队列中最早需发送的首个skb
+ * fq_flow中有两个队列, 一个是fifo链表, 一个是红黑树, 分别都是按发送时间排序
+ * 所以只要各取首个skb比较发送时间, 选择较早的
+ *
+ * skb加入队列详见:flow_queue_add()
+ */
 static struct sk_buff *fq_peek(struct fq_flow *flow)
 {
 	struct sk_buff *skb = skb_rb_first(&flow->t_root);
@@ -394,7 +474,7 @@ static void fq_erase_head(struct Qdisc *sch, struct fq_flow *flow,
 static void fq_dequeue_skb(struct Qdisc *sch, struct fq_flow *flow,
 			   struct sk_buff *skb)
 {
-	fq_erase_head(sch, flow, skb);
+	fq_erase_head(sch, flow, skb); /* 将skb从流的队列里删除 */
 	skb_mark_not_on_list(skb);
 	flow->qlen--;
 	qdisc_qstats_backlog_dec(sch, skb);
@@ -406,6 +486,9 @@ static void flow_queue_add(struct fq_flow *flow, struct sk_buff *skb)
 	struct rb_node **p, *parent;
 	struct sk_buff *head, *aux;
 
+	/* 若skb队列为空或skb的发送时间比尾部skb还晚, 那直接加到尾部,
+	 * 所以如果skb都是按发送时间加入队列的话(比如TCP), 那只用到链表(fifo)
+	 */
 	head = flow->head;
 	if (!head ||
 	    fq_skb_cb(skb)->time_to_send >= fq_skb_cb(flow->tail)->time_to_send) {
@@ -418,6 +501,12 @@ static void flow_queue_add(struct fq_flow *flow, struct sk_buff *skb)
 		return;
 	}
 
+	/* 否则如果skb不按发送时间加入队列, 那就会用到红黑树,
+	 * 以下将skb加入按发送时间排序的红黑树.
+	 * 
+	 * 注: 链表和红黑树可能同时使用, 在获取首个skb时是比较链表和红黑树的
+	 * 首个skb的发送时间, 取较早的, 详见fq_peek()
+	 */
 	p = &flow->t_root.rb_node;
 	parent = NULL;
 
@@ -445,32 +534,42 @@ static int fq_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 	struct fq_sched_data *q = qdisc_priv(sch);
 	struct fq_flow *f;
 
+	/* 超过qdisc的限制包个数则直接丢弃 */
 	if (unlikely(sch->q.qlen >= sch->limit))
 		return qdisc_drop(skb, sch, to_free);
 
-	if (!skb->tstamp) {
+	if (!skb->tstamp) { /* EDT会设置tstamp, 其他的先置为当前时间, dequeue时会根据pacing_rate计算发送时间 */
 		fq_skb_cb(skb)->time_to_send = q->ktime_cache = ktime_get_ns();
-	} else {
+	} else { /* tcp的EDT */
 		/* Check if packet timestamp is too far in the future.
 		 * Try first if our cached value, to avoid ktime_get_ns()
 		 * cost in most cases.
+		 */
+		/* 上层设置skb的发送时间如果超过此时10秒, 那么丢弃(默认,horizon_drop为1时)或置为10秒
+		 * 这里调用两次fq_packet_beyond_horizon()是为了减少ktime_get_ns()的调用
 		 */
 		if (fq_packet_beyond_horizon(skb, q)) {
 			/* Refresh our cache and check another time */
 			q->ktime_cache = ktime_get_ns();
 			if (fq_packet_beyond_horizon(skb, q)) {
-				if (q->horizon_drop) {
+				if (q->horizon_drop) { /* horizon_drop设置则直接丢弃, 默认设置 */
 					q->stat_horizon_drops++;
 					return qdisc_drop(skb, sch, to_free);
 				}
 				q->stat_horizon_caps++;
-				skb->tstamp = q->ktime_cache + q->horizon;
+				skb->tstamp = q->ktime_cache + q->horizon; /* 设置为horizon, 默认10秒 */
 			}
 		}
+		/* 设置发送时间,
+		 * tcp有了EDT后, 在__tcp_transmit_skb()中tp->tcp_wstamp_ns赋值给skb->skb_mstamp_ns(即skb->tstamp)
+		 * 也就是这个skb要发送的时间
+		 */
 		fq_skb_cb(skb)->time_to_send = skb->tstamp;
 	}
 
+	/* 从流红黑树中查找流, 新流则创建一个 */
 	f = fq_classify(skb, q);
+	/* 每个流不能超过flow_plimit个数据包, 否则丢弃(优先级队列q->internal除外) */
 	if (unlikely(f->qlen >= q->flow_plimit && f != &q->internal)) {
 		q->stat_flows_plimit++;
 		return qdisc_drop(skb, sch, to_free);
@@ -478,15 +577,16 @@ static int fq_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 
 	f->qlen++;
 	qdisc_qstats_backlog_inc(sch, skb);
+	/* 新加入的流, 两种情况, 一是新的连接, 二是之前的数据包发送完现在又有数据包了 */
 	if (fq_flow_is_detached(f)) {
-		fq_flow_add_tail(&q->new_flows, f);
+		fq_flow_add_tail(&q->new_flows, f); /* 将流加到new_flows队列中, dequeue才会进行发送 */
 		if (time_after(jiffies, f->age + q->flow_refill_delay))
-			f->credit = max_t(u32, f->credit, q->quantum);
+			f->credit = max_t(u32, f->credit, q->quantum); /* 设置发送配额 */
 		q->inactive_flows--;
 	}
 
 	/* Note: this overwrites f->age */
-	flow_queue_add(f, skb);
+	flow_queue_add(f, skb); /* 将skb加入到流的队列中 */
 
 	if (unlikely(f == &q->internal)) {
 		q->stat_internal_packets++;
@@ -496,6 +596,7 @@ static int fq_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 	return NET_XMIT_SUCCESS;
 }
 
+/* 将delayed队列中可以发送的流移到old_flows尾部 */
 static void fq_check_throttled(struct fq_sched_data *q, u64 now)
 {
 	unsigned long sample;
@@ -507,6 +608,7 @@ static void fq_check_throttled(struct fq_sched_data *q, u64 now)
 	/* Update unthrottle latency EWMA.
 	 * This is cheap and can help diagnosing timer/latency problems.
 	 */
+	/* unthrottle_latency_ns用来估算流发送的延迟时间, 按照7/8old +1/8new计算,只是统计 */
 	sample = (unsigned long)(now - q->time_next_delayed_flow);
 	q->unthrottle_latency_ns -= q->unthrottle_latency_ns >> 3;
 	q->unthrottle_latency_ns += sample >> 3;
@@ -515,10 +617,12 @@ static void fq_check_throttled(struct fq_sched_data *q, u64 now)
 	while ((p = rb_first(&q->delayed)) != NULL) {
 		struct fq_flow *f = rb_entry(p, struct fq_flow, rate_node);
 
+		/* 遍历到当前时间后退出 */
 		if (f->time_next_packet > now) {
 			q->time_next_delayed_flow = f->time_next_packet;
 			break;
 		}
+		/* 将流从delayed队列移到old_flows尾部 */
 		fq_flow_unset_throttled(q, f);
 	}
 }
@@ -536,6 +640,7 @@ static struct sk_buff *fq_dequeue(struct Qdisc *sch)
 	if (!sch->q.qlen)
 		return NULL;
 
+	/* 先看优先级队列是否有skb, 有的话优先发送 */
 	skb = fq_peek(&q->internal);
 	if (unlikely(skb)) {
 		fq_dequeue_skb(sch, &q->internal, skb);
@@ -543,12 +648,18 @@ static struct sk_buff *fq_dequeue(struct Qdisc *sch)
 	}
 
 	q->ktime_cache = now = ktime_get_ns();
+
+	/* 将delayed队列中可以发送的流移到old_flows尾部 */
 	fq_check_throttled(q, now);
 begin:
-	head = &q->new_flows;
+	head = &q->new_flows; /* 先发送new_flows里的 */
 	if (!head->first) {
-		head = &q->old_flows;
+		head = &q->old_flows; /* new_flows为空则发送old_flows里的流 */
 		if (!head->first) {
+			/* new_flows和old_flows都为空的话, 如果delayed里有待发送的,
+			 * 那么激活定时器, time_next_delayed_flow后会执行
+			 * 定时器函数qdisc_watchdog()来继续发送
+			 */
 			if (q->time_next_delayed_flow != ~0ULL)
 				qdisc_watchdog_schedule_range_ns(&q->watchdog,
 							q->time_next_delayed_flow,
@@ -558,6 +669,9 @@ begin:
 	}
 	f = head->first;
 
+	/* 发送额度用完了, 加到old_flows中然后回补额度
+	 * 所以对于流来说相当于使用RR轮询发送, 每个流固定发送额度
+	 */
 	if (f->credit <= 0) {
 		f->credit += q->quantum;
 		head->first = f->next;
@@ -565,61 +679,76 @@ begin:
 		goto begin;
 	}
 
-	skb = fq_peek(f);
+	skb = fq_peek(f); /* 取流中的首个skb */
 	if (skb) {
 		u64 time_next_packet = max_t(u64, fq_skb_cb(skb)->time_to_send,
 					     f->time_next_packet);
 
+		/* 发送时间还没到, 先加到delayed红黑树中(时间到了fq_check_throttled会移到old_flows尾部), 轮下一个流 */
 		if (now < time_next_packet) {
-			head->first = f->next;
+			head->first = f->next; /* 将这个流拿掉 */
 			f->time_next_packet = time_next_packet;
+			/* 将流fq_flow按下次发送时间排序(f->time_next_packet)加入delayed红黑树中 */
 			fq_flow_set_throttled(q, f);
 			goto begin;
 		}
 		prefetch(&skb->end);
+		/* 本该发送时间已经过去太久了默认(4294秒), 说明本地拥塞了, 设置ECN */
 		if ((s64)(now - time_next_packet - q->ce_threshold) > 0) {
 			INET_ECN_set_ce(skb);
 			q->stat_ce_mark++;
 		}
-		fq_dequeue_skb(sch, f, skb);
-	} else {
-		head->first = f->next;
+		fq_dequeue_skb(sch, f, skb); /* 将要发送该skb, 先将skb从流队列中删除 */
+	} else { /* 该流的skb发送完了 */
+		head->first = f->next; /* 将这个流拿掉 */
 		/* force a pass through old_flows to prevent starvation */
+		/* 如果当前是new_flows, 那么强制加入到old_flows中防止其他流饿死 */
 		if ((head == &q->new_flows) && q->old_flows.first) {
-			fq_flow_add_tail(&q->old_flows, f);
+			fq_flow_add_tail(&q->old_flows, f); /* 加到old_flows中 */
 		} else {
+			/* 设置为detached, 等到有新的skb enqueue时会再次被加入到new_flows中 */
 			fq_flow_set_detached(f);
 			q->inactive_flows++;
 		}
 		goto begin;
 	}
 	plen = qdisc_pkt_len(skb);
-	f->credit -= plen;
+	f->credit -= plen; /* 减去发送配额 */
 
 	if (!q->rate_enable)
 		goto out;
 
-	rate = q->flow_max_rate;
+	rate = q->flow_max_rate; /* fq可配置最大pacing_rate, 默认~0 */
 
 	/* If EDT time was provided for this skb, we need to
 	 * update f->time_next_packet only if this qdisc enforces
 	 * a flow max rate.
 	 */
-	if (!skb->tstamp) {
-		if (skb->sk)
+	/* 对EDT来说, 已经将skb的发送时间设置到skb->tstamp中了,
+	 * 所以到这里就可以直接返回skb发送了
+	 * 除非fq设置了最大速率, 才需要再计算该速率对应的下次发送时间, 设置在f->time_next_packet
+	 */
+
+	if (!skb->tstamp) { /* 没有使用EDT 或者 非TCP, 需要根据pacing rate计算发送时间 */
+		if (skb->sk) /* 获取sk的pacing rate */
 			rate = min(skb->sk->sk_pacing_rate, rate);
 
+		/* 当pacing rate低于low_rate_threshold时(默认550Kbps),
+		 * 为了保证pacing的精度,不用每次发满配额. 这样可以保证
+		 * pacing更细化.
+		 */
 		if (rate <= q->low_rate_threshold) {
 			f->credit = 0;
 		} else {
-			plen = max(plen, q->quantum);
-			if (f->credit > 0)
+			plen = max(plen, q->quantum); /* 一次至少发送配额大小, 所以plen调整为配额大小 */
+			if (f->credit > 0) /* 还未用完配额可直接发送, 也就是一次可发2个数据包 */
 				goto out;
 		}
 	}
-	if (rate != ~0UL) {
+	if (rate != ~0UL) { /* 根据pacing速率计算下次发送时间(EDT不需要计算) */
 		u64 len = (u64)plen * NSEC_PER_SEC;
 
+		/* 计算时间 next_time = plen / pacing_rate */
 		if (likely(rate))
 			len = div64_ul(len, rate);
 		/* Since socket rate can change later,
@@ -635,12 +764,12 @@ begin:
 		 * and current time (@now) can be too late by tens of us.
 		 */
 		if (f->time_next_packet)
-			len -= min(len/2, now - f->time_next_packet);
-		f->time_next_packet = now + len;
+			len -= min(len/2, now - f->time_next_packet); /* 减去校正时间 */
+		f->time_next_packet = now + len; /* 设置fq设置的最大速率换算出来的下次发送时间 */
 	}
 out:
 	qdisc_bstats_update(sch, skb);
-	return skb;
+	return skb; /* 返回skb会在qdisc_restart()中被发送 */
 }
 
 static void fq_flow_purge(struct fq_flow *flow)
@@ -930,10 +1059,10 @@ static int fq_init(struct Qdisc *sch, struct nlattr *opt,
 	struct fq_sched_data *q = qdisc_priv(sch);
 	int err;
 
-	sch->limit		= 10000;
-	q->flow_plimit		= 100;
-	q->quantum		= 2 * psched_mtu(qdisc_dev(sch));
-	q->initial_quantum	= 10 * psched_mtu(qdisc_dev(sch));
+	sch->limit		= 10000;	/* 限制每个qdisc的队列包个数 */
+	q->flow_plimit		= 100;		/* 限制每个流缓存的数据包个数，超过后会丢弃 */
+	q->quantum		= 2 * psched_mtu(qdisc_dev(sch)); /* 流每次发送的配额为2两个包(mtu+14) */
+	q->initial_quantum	= 10 * psched_mtu(qdisc_dev(sch)); /* 流初始化发送配额, 默认为10个数据包大小 */
 	q->flow_refill_delay	= msecs_to_jiffies(40);
 	q->flow_max_rate	= ~0UL;
 	q->time_next_delayed_flow = ~0ULL;
@@ -944,10 +1073,14 @@ static int fq_init(struct Qdisc *sch, struct nlattr *opt,
 	q->fq_root		= NULL;
 	q->fq_trees_log		= ilog2(1024);
 	q->orphan_mask		= 1024 - 1;
-	q->low_rate_threshold	= 550000 / 8;
+	q->low_rate_threshold	= 550000 / 8; /* 550Kbps是个经验值, commit说在YouTube video上测试了两年 */
 
 	q->timer_slack = 10 * NSEC_PER_USEC; /* 10 usec of hrtimer slack */
 
+	/* horizon默认为10秒, 表示容许设置skb将要的发送时间
+	 * 即enqueue时上层设置skb的发送时间如果超过此时10秒, 那么:
+	 * horizon_drop为1时直接丢弃, 否则设置为10秒
+	 */
 	q->horizon = 10ULL * NSEC_PER_SEC; /* 10 seconds */
 	q->horizon_drop = 1; /* by default, drop packets beyond horizon */
 
