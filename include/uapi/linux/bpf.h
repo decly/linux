@@ -984,7 +984,7 @@ enum bpf_prog_type {
 	BPF_PROG_TYPE_STRUCT_OPS,
 	BPF_PROG_TYPE_EXT,
 	BPF_PROG_TYPE_LSM,
-	BPF_PROG_TYPE_SK_LOOKUP,
+	BPF_PROG_TYPE_SK_LOOKUP,	/* sock—°‘Ò(tcp listenªÚudp∑«connected) */
 	BPF_PROG_TYPE_SYSCALL, /* a program that can execute syscalls */
 	BPF_PROG_TYPE_NETFILTER,
 };

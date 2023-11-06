@@ -8634,6 +8634,7 @@ int bpf_program__set_log_buf(struct bpf_program *prog, char *log_buf, size_t log
 	return 0;
 }
 
+/* __VA_ARGS__ 是赋值给prog_attach_fn的 */
 #define SEC_DEF(sec_pfx, ptype, atype, flags, ...) {			    \
 	.sec = (char *)sec_pfx,						    \
 	.prog_type = BPF_PROG_TYPE_##ptype,				    \
@@ -8654,6 +8655,13 @@ static int attach_kprobe_multi(const struct bpf_program *prog, long cookie, stru
 static int attach_lsm(const struct bpf_program *prog, long cookie, struct bpf_link **link);
 static int attach_iter(const struct bpf_program *prog, long cookie, struct bpf_link **link);
 
+/* - 首个参数name中(匹配详见 sec_def_matches )
+ *   - type/ 要求SEC必须有 type/ 前缀, 比如SEC("type/xxx")
+ *   - type+ 要求SEC可以是 type 或者有 type/ 前缀, 比如SEC("type")或者SEC("type/xxx")
+ *   - 其他的需要严格一致, 包括 / 符号在中间的
+ * - 指定SEC时可以在name前增加 ? 符号, 表示不设置autoload, 比如 SEC("?type") 
+ * - 存在第五个参数的才支持autoattach, 即prog_attach_fn函数 (详见bpf_object__attach_skeleton())
+ */
 static const struct bpf_sec_def section_defs[] = {
 	SEC_DEF("socket",		SOCKET_FILTER, 0, SEC_NONE),
 	SEC_DEF("sk_reuseport/migrate",	SK_REUSEPORT, BPF_SK_REUSEPORT_SELECT_OR_MIGRATE, SEC_ATTACHABLE),
@@ -10638,6 +10646,7 @@ error:
 	return libbpf_err_ptr(err);
 }
 
+/* attach kprobe和kretprobe的函数 */
 static int attach_kprobe(const struct bpf_program *prog, long cookie, struct bpf_link **link)
 {
 	DECLARE_LIBBPF_OPTS(bpf_kprobe_opts, opts);
@@ -12859,10 +12868,12 @@ int bpf_object__attach_skeleton(struct bpf_object_skeleton *s)
 		struct bpf_program *prog = *s->progs[i].prog;
 		struct bpf_link **link = s->progs[i].link;
 
+		/* 默认autoload(可以指定SEC("?xxx")时以?开头来关闭)和autoattach都开启 */
 		if (!prog->autoload || !prog->autoattach)
 			continue;
 
 		/* auto-attaching not supported for this program */
+		/* 有prog_attach_fn的才支持本接口attach(即section_defs数组中指定了第五个参数的那些类型) */
 		if (!prog->sec_def || !prog->sec_def->prog_attach_fn)
 			continue;
 
@@ -12870,6 +12881,7 @@ int bpf_object__attach_skeleton(struct bpf_object_skeleton *s)
 		if (*link)
 			continue;
 
+		/* 这里调用attach函数, 在section_defs数组第五个参数中指定, 比如kprobe为attach_kprobe() */
 		err = prog->sec_def->prog_attach_fn(prog, prog->sec_def->cookie, link);
 		if (err) {
 			pr_warn("prog '%s': failed to auto-attach: %d\n",
