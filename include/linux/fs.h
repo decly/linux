@@ -1011,7 +1011,9 @@ struct file {
 	struct file_ra_state	f_ra;
 	struct path		f_path;
 	struct inode		*f_inode;	/* cached value */
-	const struct file_operations	*f_op;
+	const struct file_operations	*f_op;	/* socket对应socket_file_ops
+						 * epoll对应eventpoll_fops
+						 */
 
 	u64			f_version;
 #ifdef CONFIG_SECURITY

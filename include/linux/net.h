@@ -124,6 +124,10 @@ struct socket {
 	struct file		*file;
 	struct sock		*sk;
 	const struct proto_ops	*ops; /* Might change with IPV6_ADDRFORM or MPTCP. */
+					/* 如果是SOCK_STREAM,
+					 * ipv4为inet_stream_ops
+					 * ipv6为inet6_stream_ops
+					 */
 
 	struct socket_wq	wq;
 };
