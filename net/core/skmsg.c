@@ -553,7 +553,7 @@ static int sk_psock_skb_ingress_enqueue(struct sk_buff *skb,
 
 	sk_psock_queue_msg(psock, msg); /* 加入到psock->ingress_msg */
 	sk_psock_data_ready(sk, psock); /* 这里调用原始的sk_data_ready来唤醒应用层接收,
-					 * 然后应用层调用recv()时会调用tcp_bpf_recvmsg()
+					 * 然后应用层调用recv()时会调用tcp_bpf_recvmsg_parser()
 					 * 来从poskc->ingress_msg接收数据
 					 */
 	return copied;
@@ -1059,6 +1059,7 @@ static int sk_psock_verdict_apply(struct sk_psock *psock, struct sk_buff *skb,
 		}
 		break;
 	case __SK_REDIRECT: /* 重定向到其他sock处理 */
+		/* 重定向到其他sock前需要更新本sock的tp->copied_seq, 否则和rcv_nxt无法匹配 */
 		tcp_eat_skb(psock->sk, skb);
 		err = sk_psock_skb_redirect(psock, skb);
 		break;
@@ -1268,6 +1269,7 @@ static void sk_psock_verdict_data_ready(struct sock *sk)
 	ops = READ_ONCE(sock->ops);
 	if (!ops || !ops->read_skb)
 		return;
+	/* tcp调用tcp_read_skb(), 从sk_receive_queue取出skb交由sk_psock_verdict_recv处理 */
 	copied = ops->read_skb(sk, sk_psock_verdict_recv);
 	if (copied >= 0) {
 		struct sk_psock *psock;

@@ -215,6 +215,33 @@ static bool is_next_msg_fin(struct sk_psock *psock)
 	return false;
 }
 
+/* 接收重定向(即使用了stream_verdict/skb_verdict)的接收函数(也包括同时也使用msg_parser)
+ * 与tcp_bpf_recvmsg()的区别是: 本函数只会从psock->ingress_msg中读取数据(也会更新tp->copied_seq),
+ * 但不会读取sk->sk_receive_queue
+ *
+ * 这是因为 commit c5d2177a72a16 中提到的: 应用层recv()可能与bpf程序在sk_receive_queue上竞争
+ *
+ *       AppB
+ *       recv()                (userspace)
+ *     -----------------------
+ *       tcp_bpf_recvmsg()     (kernel)
+ *         |             |
+ *         |             |
+ *         |             |
+ *       ingress_msgQ    |
+ *         |             |
+ *       RX_BPF          |
+ *         |             |
+ *         v             v
+ *       sk->receive_queue
+ *
+ * tcp_bpf_recvmsg()会先从ingress_msg中读取, 没有的话则读取sk_receive_queue,
+ * 但是在接收重定向中, 数据是先保存到sk_receive_queue, 然后调用bpf程序来处理的
+ * (__SK_PASS保存到自身psock->ingress_msg, 而__SK_REDIRECT则会发往其他sock)
+ * 这样会出问题: 如果应用层频繁调用recv(), 那么会从sk_receive_queue中读取走还未经过
+ * bpf程序处理的数据.
+ * 所以, 这里只能读取经过bpf程序处理后的ingress_msg队列, 不能去读取sk_receive_queue队列
+ */
 static int tcp_bpf_recvmsg_parser(struct sock *sk,
 				  struct msghdr *msg,
 				  size_t len,
@@ -328,6 +355,12 @@ unlock:
 	return copied;
 }
 
+/* 发送重定向(即只使用msg_parser)的接收函数(接收重定向使用的是tcp_bpf_recvmsg_parser)
+ * 优先从psock->ingress_msg中接收数据, 没有的话从sk->sk_receive_queue中接收数据
+ *
+ * 另外, 发送重定向接收是不更新tp->copied_seq的, 因为重定向是直接排队到目标psock->ingress_msg中的,
+ * 数据没有先进入sk->sk_receive_queue中(也就没有更新tp->rcv_nxt), 所以对应的接收时也不应该增加copied_seq
+ */
 static int tcp_bpf_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
 			   int flags, int *addr_len)
 {
@@ -612,10 +645,10 @@ enum {
 };
 
 enum {
-	TCP_BPF_BASE,
-	TCP_BPF_TX,
-	TCP_BPF_RX,
-	TCP_BPF_TXRX,
+	TCP_BPF_BASE,		/* 基础 */
+	TCP_BPF_TX,		/* 只发送重定向(msg_parser) */
+	TCP_BPF_RX,		/* 只接收重定向(stream_parser/skb_verdict) */
+	TCP_BPF_TXRX,		/* 同时使用了发送重定向和接收重定向 */
 	TCP_BPF_NUM_CFGS,
 };
 
@@ -626,22 +659,24 @@ static struct proto tcp_bpf_prots[TCP_BPF_NUM_PROTS][TCP_BPF_NUM_CFGS];
 static void tcp_bpf_rebuild_protos(struct proto prot[TCP_BPF_NUM_CFGS],
 				   struct proto *base)
 {
-	/* stream_parser (BPF_PROG_TYPE_SK_SKB)使用, 主要修改接收接口 */
+	/* BASE, 下面的TX,RX,TXRX都会基于此 */
 	prot[TCP_BPF_BASE]			= *base; 		/* 先复制tcp_prot */
 	prot[TCP_BPF_BASE].destroy		= sock_map_destroy;
 	prot[TCP_BPF_BASE].close		= sock_map_close;	/* 释放操作以及将sock从sockmap中删除 */
-	prot[TCP_BPF_BASE].recvmsg		= tcp_bpf_recvmsg; 	/* 从psock接收数据 */
+	prot[TCP_BPF_BASE].recvmsg		= tcp_bpf_recvmsg; 	/* 发送重定向的接收函数 */
 	prot[TCP_BPF_BASE].sock_is_readable	= sk_msg_is_readable;
 
-	/* msg_parser (BPF_PROG_TYPE_SK_MSG)使用, 在TCP_BPF_BASE基础上增加修改发送接口 */
-	prot[TCP_BPF_TX]			= prot[TCP_BPF_BASE];	/* 先复制上面的TCP_BPF_BASE */
-	prot[TCP_BPF_TX].sendmsg		= tcp_bpf_sendmsg;	/* 用于msg_parser处理发送重定向 */
+	/* TX: 只使用发送重定向msg_parser(BPF_PROG_TYPE_SK_MSG), 需要修改sendmsg(重定向发送)和recvmsg接口(重定向后的接收) */
+	prot[TCP_BPF_TX]			= prot[TCP_BPF_BASE];		/* 基于TCP_BPF_BASE */
+	prot[TCP_BPF_TX].sendmsg		= tcp_bpf_sendmsg;		/* 用于msg_parser处理发送重定向 */
 
-	prot[TCP_BPF_RX]			= prot[TCP_BPF_BASE];
-	prot[TCP_BPF_RX].recvmsg		= tcp_bpf_recvmsg_parser;
+	/* RX: 只使用接收重定向stream_verdict/skb_verdict(BPF_PROG_TYPE_SK_SKB), 修改recvmsg接口 */
+	prot[TCP_BPF_RX]			= prot[TCP_BPF_BASE];		/* 基于TCP_BPF_BASE */
+	prot[TCP_BPF_RX].recvmsg		= tcp_bpf_recvmsg_parser;	/* 使用接收重定向的接收函数 */
 
-	prot[TCP_BPF_TXRX]			= prot[TCP_BPF_TX];
-	prot[TCP_BPF_TXRX].recvmsg		= tcp_bpf_recvmsg_parser;
+	/* TXRX: 同时使用了接收重定向(stream_verdict/skb_verdict)和发送重定向(msg_parser) */
+	prot[TCP_BPF_TXRX]			= prot[TCP_BPF_TX];		/* 基于TCP_BPF_TX */
+	prot[TCP_BPF_TXRX].recvmsg		= tcp_bpf_recvmsg_parser; 	/* 使用接收重定向的接收函数 */
 }
 
 static void tcp_bpf_check_v6_needs_rebuild(struct proto *ops)
@@ -678,6 +713,11 @@ int tcp_bpf_update_proto(struct sock *sk, struct sk_psock *psock, bool restore)
 	int family = sk->sk_family == AF_INET6 ? TCP_BPF_IPV6 : TCP_BPF_IPV4;
 	int config = psock->progs.msg_parser   ? TCP_BPF_TX   : TCP_BPF_BASE;
 
+	/* config的取值:
+	 * - TCP_BPF_TX, 只使用发送重定向(msg_parser)
+	 * - TCP_BPF_RX, 只接收重定向(stream_verdict或skb_verdict)
+	 * - TCP_BPF_TXRX, 同时使用发送重定向(msg_parser)和接收重定向(stream_verdict或skb_verdict)
+	 */
 	if (psock->progs.stream_verdict || psock->progs.skb_verdict) {
 		config = (config == TCP_BPF_TX) ? TCP_BPF_TXRX : TCP_BPF_RX;
 	}
