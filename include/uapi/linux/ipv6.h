@@ -127,7 +127,7 @@ struct ipv6hdr {
 #endif
 	__u8			flow_lbl[3];
 
-	__be16			payload_len;
+	__be16			payload_len;	/* 包括所有扩展首部和整个TCP, 不包括ipv6首部 */
 	__u8			nexthdr;
 	__u8			hop_limit;
 

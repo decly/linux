@@ -154,12 +154,20 @@ struct frag_hdr {
 /*
  * Jumbo payload option, as described in RFC 2675 2.
  */
+/* big tcp使用的ipv6 HBH扩展头
+ * - 在发送时在ip层添加: ip6_xmit()
+ * - 然后在
+ *   - 驱动发送时移除: mlx4_en_xmit()
+ *   - 或者本地虚拟网卡在gso offload时移除: ipv6_gso_segment()
+ */
 struct hop_jumbo_hdr {
-	u8	nexthdr;
-	u8	hdrlen;
+	u8	nexthdr;	/* 原ipv6hdr->nexthdr, 比如IPPROTO_TCP */
+	u8	hdrlen;		/* 置0 */
 	u8	tlv_type;	/* IPV6_TLV_JUMBO, 0xC2 */
 	u8	tlv_len;	/* 4 */
-	__be32	jumbo_payload_len;
+	__be32	jumbo_payload_len; /* IP数据部分的长度(和ipv6hdr->payload_len一样包括所有扩展首部和整个TCP),
+				    * 即代替了ipv6hdr->payload_len(使用big tcp后payload_len为0)
+				    */
 };
 
 #define	IP6_MF		0x0001

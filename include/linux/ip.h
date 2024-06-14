@@ -38,6 +38,9 @@ static inline unsigned int ip_transport_len(const struct sk_buff *skb)
 
 static inline unsigned int iph_totlen(const struct sk_buff *skb, const struct iphdr *iph)
 {
+	/* ipv4 big tcp当单个skb的IP数据长度超过IP_MAX_MTU时会将iph->tot_len置位0
+	 * 来表示big tcp (详见iph_set_totlen), 此时则根据skb->len来得到ip数据大小
+	 */
 	u32 len = ntohs(iph->tot_len);
 
 	return (len || !skb_is_gso(skb) || !skb_is_gso_tcp(skb)) ?
@@ -54,6 +57,7 @@ static inline unsigned int skb_ip_totlen(const struct sk_buff *skb)
 
 static inline void iph_set_totlen(struct iphdr *iph, unsigned int len)
 {
+	/* big tcp若长度超过64kb置0, iph_totlen()会根据skb->len来得到真实长度 */
 	iph->tot_len = len <= IP_MAX_MTU ? htons(len) : 0;
 }
 #endif	/* _LINUX_IP_H */

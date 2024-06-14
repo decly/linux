@@ -287,6 +287,13 @@ int ip6_xmit(const struct sock *sk, struct sk_buff *skb, struct flowi6 *fl6,
 					     &fl6->saddr);
 	}
 
+	/* big tcp: 对超过65535的skb添加HBH扩展头, ipv6->payload_len设置为0
+	 * 网卡驱动中发送前移除掉HBH扩展头，比如mlx4中:
+	 * 	mlx4_en_xmit()
+	 * 	  get_real_size()
+	 * 	    ipv6_has_hopopt_jumbo() 判断是否有HBH扩展头
+	 * 	  移除HBH扩展头
+	 */
 	if (unlikely(seg_len > IPV6_MAXPLEN)) {
 		hop_jumbo = skb_push(skb, hoplen);
 
@@ -294,10 +301,10 @@ int ip6_xmit(const struct sock *sk, struct sk_buff *skb, struct flowi6 *fl6,
 		hop_jumbo->hdrlen = 0;
 		hop_jumbo->tlv_type = IPV6_TLV_JUMBO;
 		hop_jumbo->tlv_len = 4;
-		hop_jumbo->jumbo_payload_len = htonl(seg_len + hoplen);
+		hop_jumbo->jumbo_payload_len = htonl(seg_len + hoplen); /* 加上HBH扩展首部大小 */
 
 		proto = IPPROTO_HOPOPTS;
-		seg_len = 0;
+		seg_len = 0; /* ipv6->payload_len设置为0 */
 		IP6CB(skb)->flags |= IP6SKB_FAKEJUMBO;
 	}
 

@@ -101,6 +101,7 @@ int __ip_local_out(struct net *net, struct sock *sk, struct sk_buff *skb)
 {
 	struct iphdr *iph = ip_hdr(skb);
 
+	/* 设置ip首部的长度字段, big tcp超过65535则设置0 */
 	iph_set_totlen(iph, skb->len);
 	ip_send_check(iph);
 

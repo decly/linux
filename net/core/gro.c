@@ -123,6 +123,7 @@ int skb_gro_receive(struct sk_buff *p, struct sk_buff *skb)
 		return -E2BIG;
 
 	if (unlikely(p->len + len >= GRO_LEGACY_MAX_SIZE)) {
+		/* big tcp 才能允许单个skb超过64kb */
 		if (NAPI_GRO_CB(skb)->proto != IPPROTO_TCP ||
 		    (p->protocol == htons(ETH_P_IPV6) &&
 		     skb_headroom(p) < sizeof(struct hop_jumbo_hdr)) ||

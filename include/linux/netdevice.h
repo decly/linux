@@ -2238,7 +2238,7 @@ struct net_device {
 /* TCP minimal MSS is 8 (TCP_MIN_GSO_SIZE),
  * and shinfo->gso_segs is a 16bit field.
  */
-#define GRO_MAX_SIZE		(8 * 65535u)
+#define GRO_MAX_SIZE		(8 * 65535u)	/* big tcp 限制为512kb */
 	unsigned int		gro_max_size;
 	unsigned int		gro_ipv4_max_size;
 	unsigned int		xdp_zc_max_segs;
@@ -2357,14 +2357,16 @@ struct net_device {
  */
 #define GSO_MAX_SIZE		(8 * GSO_MAX_SEGS)
 
-	unsigned int		gso_max_size;
+	unsigned int		gso_max_size;		/* ipv6最大gso大小, ipv4对应为gso_ipv4_max_size,
+							 * 默认是GSO_LEGACY_MAX_SIZE, big tcp可以最大GSO_MAX_SEGS
+							 */
 #define TSO_LEGACY_MAX_SIZE	65536
 #define TSO_MAX_SIZE		UINT_MAX
 	unsigned int		tso_max_size;
 	u16			gso_max_segs;
 #define TSO_MAX_SEGS		U16_MAX
 	u16			tso_max_segs;
-	unsigned int		gso_ipv4_max_size;
+	unsigned int		gso_ipv4_max_size;	/* ipv4最大gso大小 */
 
 #ifdef CONFIG_DCB
 	const struct dcbnl_rtnl_ops *dcbnl_ops;
