@@ -549,8 +549,8 @@ enum
 {
 	HI_SOFTIRQ=0,
 	TIMER_SOFTIRQ,
-	NET_TX_SOFTIRQ,
-	NET_RX_SOFTIRQ,
+	NET_TX_SOFTIRQ,		/* 软中断发送函数net_tx_action() */
+	NET_RX_SOFTIRQ,		/* 软中断收包函数net_rx_action() */
 	BLOCK_SOFTIRQ,
 	IRQ_POLL_SOFTIRQ,
 	TASKLET_SOFTIRQ,

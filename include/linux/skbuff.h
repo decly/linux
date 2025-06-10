@@ -891,8 +891,10 @@ struct sk_buff {
 #if defined(CONFIG_NF_CONNTRACK) || defined(CONFIG_NF_CONNTRACK_MODULE)
 	unsigned long		 _nfct;
 #endif
-	unsigned int		len,
-				data_len;
+	unsigned int		len,		/* skb数据的长度, 包括线性空间和分片的数据 */
+				data_len;	/* 切片数据的长度, 即skb_shared_info中的长度
+						 * 所以线性数据的长度为: skb->len - skb->data_len
+						 */
 	__u16			mac_len,
 				hdr_len;
 

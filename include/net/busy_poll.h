@@ -123,7 +123,7 @@ static inline void skb_mark_napi_id(struct sk_buff *skb,
 	 * it.
 	 */
 	if (skb->napi_id < MIN_NAPI_ID)
-		skb->napi_id = napi->napi_id;
+		skb->napi_id = napi->napi_id; /* skb±ê¼Çnapi_id */
 #endif
 }
 

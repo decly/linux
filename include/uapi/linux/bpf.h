@@ -6433,6 +6433,13 @@ struct sk_reuseport_md { /* BPF_PROG_TYPE_SK_REUSEPORT的上下文, 初始化详见sk_reu
 	 * sk that is fully established or a reqsk that is in-the-middle
 	 * of 3-way handshake.
 	 */
+	/* sk和migrating_sk是在reuseport连接迁移时加入的, 但sk在非迁移时也可使用
+	 * reuseport连接迁移: listen sock关闭后, 其关联的accpet队列下的child sock和
+	 * 		      正处于半连接的request sock可重新迁移到另一个正常服务的listen sock上
+	 *
+	 * 非连接迁移的attach type为 BPF_SK_REUSEPORT_SELECT (默认)
+	 * 连接迁移的attach type为 BPF_SK_REUSEPORT_SELECT_OR_MIGRATE
+	 */
 	__bpf_md_ptr(struct bpf_sock *, sk);
 	__bpf_md_ptr(struct bpf_sock *, migrating_sk);
 };

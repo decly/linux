@@ -267,6 +267,7 @@ static void napi_gro_complete(struct napi_struct *napi, struct sk_buff *skb)
 	}
 
 out:
+	/* 最终都是保存napi->rx_list中再统一提交给协议栈 */
 	gro_normal_one(napi, skb, NAPI_GRO_CB(skb)->count);
 }
 
@@ -276,7 +277,9 @@ static void __napi_gro_flush_chain(struct napi_struct *napi, u32 index,
 	struct list_head *head = &napi->gro_hash[index].list;
 	struct sk_buff *skb, *p;
 
+	/* 倒序处理, 因为gro_hash是按照时间倒序排序的(最后收到的skb在队首) */
 	list_for_each_entry_safe_reverse(skb, p, head, list) {
+		/* flush_old表示只处理旧的包(不是本个jiffies被接收的) */
 		if (flush_old && NAPI_GRO_CB(skb)->age == jiffies)
 			return;
 		skb_list_del_init(skb);
@@ -284,6 +287,7 @@ static void __napi_gro_flush_chain(struct napi_struct *napi, u32 index,
 		napi->gro_hash[index].count--;
 	}
 
+	/* 该桶空了, 清除gro_bitmask相应位 */
 	if (!napi->gro_hash[index].count)
 		__clear_bit(index, &napi->gro_bitmask);
 }
@@ -297,9 +301,9 @@ void napi_gro_flush(struct napi_struct *napi, bool flush_old)
 	unsigned long bitmask = napi->gro_bitmask;
 	unsigned int i, base = ~0U;
 
-	while ((i = ffs(bitmask)) != 0) {
-		bitmask >>= i;
-		base += i;
+	while ((i = ffs(bitmask)) != 0) { /* 找到第一个被设置的位 */
+		bitmask >>= i;	/* 移除已处理的位 */
+		base += i;	/* 得到实际gro_hash桶索引 */
 		__napi_gro_flush_chain(napi, base, flush_old);
 	}
 }
@@ -438,7 +442,7 @@ static void gro_flush_oldest(struct napi_struct *napi, struct list_head *head)
 static enum gro_result dev_gro_receive(struct napi_struct *napi, struct sk_buff *skb)
 {
 	u32 bucket = skb_get_hash_raw(skb) & (GRO_HASH_BUCKETS - 1);
-	struct gro_list *gro_list = &napi->gro_hash[bucket];
+	struct gro_list *gro_list = &napi->gro_hash[bucket]; /* gro_hash桶 */
 	struct list_head *head = &offload_base;
 	struct packet_offload *ptype;
 	__be16 type = skb->protocol;
@@ -446,18 +450,23 @@ static enum gro_result dev_gro_receive(struct napi_struct *napi, struct sk_buff 
 	enum gro_result ret;
 	int same_flow;
 
+	/* 网卡没开启gro或者加载了XDP, 跳过gro流程 */
 	if (netif_elide_gro(skb->dev))
 		goto normal;
 
 	gro_list_prepare(&gro_list->list, skb);
 
 	rcu_read_lock();
+	/* 查看skb的网络层协议类型是否支持gro
+	 * ipv4: ip_packet_offload
+	 * ipv6: ipv6_packet_offload
+	 */
 	list_for_each_entry_rcu(ptype, head, list) {
 		if (ptype->type == type && ptype->callbacks.gro_receive)
-			goto found_ptype;
+			goto found_ptype; /* 走gro流程 */
 	}
 	rcu_read_unlock();
-	goto normal;
+	goto normal; /* 不支持则跳过gro流程 */
 
 found_ptype:
 	skb_set_network_header(skb, skb_gro_offset(skb));
@@ -488,6 +497,9 @@ found_ptype:
 		break;
 	}
 
+	/* ipv4调用 inet_gro_receive(&gro_list->list, skb)
+	 * ipv6调用 ipv6_gro_receive(&gro_list->list, skb)
+	 */
 	pp = INDIRECT_CALL_INET(ptype->callbacks.gro_receive,
 				ipv6_gro_receive, inet_gro_receive,
 				&gro_list->list, skb);
@@ -528,6 +540,7 @@ found_ptype:
 	list_add(&skb->list, &gro_list->list);
 	ret = GRO_HELD;
 ok:
+	/* 设置gro_bitmask中桶对应的位, 有skb则置位否则清零 */
 	if (gro_list->count) {
 		if (!test_bit(bucket, &napi->gro_bitmask))
 			__set_bit(bucket, &napi->gro_bitmask);
@@ -576,7 +589,7 @@ static gro_result_t napi_skb_finish(struct napi_struct *napi,
 				    gro_result_t ret)
 {
 	switch (ret) {
-	case GRO_NORMAL:
+	case GRO_NORMAL: /* GRO聚合结束或者无法聚合的skb, 缓存在napi->rx_list */
 		gro_normal_one(napi, skb, 1);
 		break;
 
@@ -598,6 +611,7 @@ static gro_result_t napi_skb_finish(struct napi_struct *napi,
 	return ret;
 }
 
+/* 收包核心函数, 会尝试GRO聚合. 比如网卡驱动poll函数针对skb调用来收包 */
 gro_result_t napi_gro_receive(struct napi_struct *napi, struct sk_buff *skb)
 {
 	gro_result_t ret;
@@ -607,6 +621,9 @@ gro_result_t napi_gro_receive(struct napi_struct *napi, struct sk_buff *skb)
 
 	skb_gro_reset_offset(skb, 0);
 
+	/* 先调用dev_gro_receive尝试GRO聚合
+	 * 然后调用napi_skb_finish针对结果看是否立刻提交给协议栈
+	 */
 	ret = napi_skb_finish(napi, skb, dev_gro_receive(napi, skb));
 	trace_napi_gro_receive_exit(ret);
 

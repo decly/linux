@@ -8150,6 +8150,7 @@ static irqreturn_t igb_intr(int irq, void *data)
 	/* Interrupt Auto-Mask...upon reading ICR, interrupts are masked.  No
 	 * need for the IMC write
 	 */
+	/* 这里关闭中断: igb网卡一旦读取ICR(中断原因寄存器)后, 硬件会自动屏蔽中断 */
 	u32 icr = rd32(E1000_ICR);
 
 	/* IMS will not auto-mask if INT_ASSERTED is not set, and if it is
@@ -8225,22 +8226,29 @@ static int igb_poll(struct napi_struct *napi, int budget)
 		clean_complete = igb_clean_tx_irq(q_vector, budget);
 
 	if (q_vector->rx.ring) {
+		/* 从网卡收包, 返回接收的包个数 */
 		int cleaned = igb_clean_rx_irq(q_vector, budget);
 
 		work_done += cleaned;
-		if (cleaned >= budget)
+		if (cleaned >= budget) /* 收满budget的限制, 标记还未收完 */
 			clean_complete = false;
 	}
 
 	/* If all work not completed, return budget and keep polling */
+	/* 还没收完数据包, 直接返回(保持关中断)
+	 * __napi_poll()会设置repoll, 然后软中断会再次调用poll()来收包
+	 */
 	if (!clean_complete)
 		return budget;
 
 	/* Exit the polling mode, but don't re-enable interrupts if stack might
 	 * poll us due to busy-polling
 	 */
+	/* 收完了所有数据包则调用napi_complete_done() (与napi_schedule()配对)
+	 * 然后打开中断等待下次收包
+	 */
 	if (likely(napi_complete_done(napi, work_done)))
-		igb_ring_irq_enable(q_vector);
+		igb_ring_irq_enable(q_vector); /* 开中断 */
 
 	return work_done;
 }
@@ -8907,7 +8915,7 @@ static int igb_clean_rx_irq(struct igb_q_vector *q_vector, const int budget)
 #endif
 	xdp_init_buff(&xdp, frame_sz, &rx_ring->xdp_rxq);
 
-	while (likely(total_packets < budget)) {
+	while (likely(total_packets < budget)) { /* 最多接收budget个包 */
 		union e1000_adv_rx_desc *rx_desc;
 		struct igb_rx_buffer *rx_buffer;
 		ktime_t timestamp = 0;
@@ -9006,6 +9014,7 @@ static int igb_clean_rx_irq(struct igb_q_vector *q_vector, const int budget)
 		/* populate checksum, timestamp, VLAN, and protocol */
 		igb_process_skb_fields(rx_ring, rx_desc, skb);
 
+		/* gro接收skb */
 		napi_gro_receive(&q_vector->napi, skb);
 
 		/* reset skb pointer */

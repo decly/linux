@@ -349,30 +349,42 @@ struct gro_list {
 /*
  * Structure for NAPI scheduling similar to tasklet but with weighting
  */
-struct napi_struct {
+struct napi_struct { /* 每个napi_struct对应一个网卡队列 */
 	/* The poll_list must only be managed by the entity which
 	 * changes the state of the NAPI_STATE_SCHED bit.  This means
 	 * whoever atomically sets that bit can add this napi_struct
 	 * to the per-CPU poll_list, and whoever clears that bit
 	 * can remove from the list right before clearing the bit.
 	 */
-	struct list_head	poll_list;
+	struct list_head	poll_list;	/* 用于将本napi_struct链接到softnet_data->poll_list
+						 * 并且会设置NAPI_STATE_SCHED标志
+						 */
 
-	unsigned long		state;
+	unsigned long		state;		/* 下面 NAPI_STATE_* 各标志 */
 	int			weight;
 	int			defer_hard_irqs_count;
-	unsigned long		gro_bitmask;
+	unsigned long		gro_bitmask;	/* 每一位置位对应gro_hash的一个桶非空,
+						 * 即gro_hash的桶中有skb即设置相应位,
+						 * 目的是在napi_gro_flush()中只处理非空的桶
+						 */
+	/* 收包函数, 由网卡驱动提供, 比如 igb_poll() */
 	int			(*poll)(struct napi_struct *, int);
 #ifdef CONFIG_NETPOLL
 	/* CPU actively polling if netpoll is configured */
 	int			poll_owner;
 #endif
 	/* CPU on which NAPI has been scheduled for processing */
-	int			list_owner;
+	int			list_owner;	/* 调度的CPU id, 即被加入的softnet_data的CPU */
 	struct net_device	*dev;
-	struct gro_list		gro_hash[GRO_HASH_BUCKETS];
+	struct gro_list		gro_hash[GRO_HASH_BUCKETS];	/* gro收包缓存skb的哈希表, gro接收时会先将skb缓存在这,
+								 * 聚合结束还是会加入rx_list链表再一次性提交给协议栈
+								 * 详见 napi_gro_receive() -> napi_skb_finish() -> gro_normal_one()
+								 */
 	struct sk_buff		*skb;
 	struct list_head	rx_list; /* Pending GRO_NORMAL skbs */
+					/* 所有napi要提交给协议栈的skb都会缓存在这,
+					 * 然后由gro_normal_one()统一批量提交
+					 */
 	int			rx_count; /* length of rx_list */
 	unsigned int		napi_id;
 	struct hrtimer		timer;
@@ -384,8 +396,13 @@ struct napi_struct {
 
 enum {
 	NAPI_STATE_SCHED,		/* Poll is scheduled */
+					/* napi_struct已经被加入到softnet_data->poll_list中,
+					 * 软中断net_rx_action()会调用poll函数收包
+					 */
 	NAPI_STATE_MISSED,		/* reschedule a napi */
+					/* 重复设置NAPI_STATE_SCHED了 */
 	NAPI_STATE_DISABLE,		/* Disable pending */
+					/* 禁止NAPI poll被调用(比如关闭,重置或参数变更时) */
 	NAPI_STATE_NPSVC,		/* Netpoll - don't dequeue from poll_list */
 	NAPI_STATE_LISTED,		/* NAPI added to system lists */
 	NAPI_STATE_NO_BUSY_POLL,	/* Do not add in napi_hash, no busy polling */
@@ -489,8 +506,16 @@ bool napi_schedule_prep(struct napi_struct *n);
  * Schedule NAPI poll routine to be called if it is not already
  * running.
  */
+/*  */
 static inline void napi_schedule(struct napi_struct *n)
 {
+	/* 设置NAPI_STATE_SCHED
+	 * 新设置(没有重复设置)则调用__napi_schedule()
+	 * 将napi_struct加入本地CPU的softnet_data中, 并且触发收包的软中断
+	 *
+	 * (在数据包全部被接收后驱动poll函数会调用napi_complete_done()
+	 *  来删除NAPI_STATE_SCHED标志)
+	 */
 	if (napi_schedule_prep(n))
 		__napi_schedule(n);
 }
@@ -2358,7 +2383,7 @@ struct net_device {
 #define GSO_MAX_SIZE		(8 * GSO_MAX_SEGS)
 
 	unsigned int		gso_max_size;		/* ipv6最大gso大小, ipv4对应为gso_ipv4_max_size,
-							 * 默认是GSO_LEGACY_MAX_SIZE, big tcp可以最大GSO_MAX_SEGS
+							 * 默认是GSO_LEGACY_MAX_SIZE, big tcp可以最大GSO_MAX_SIZE
 							 */
 #define TSO_LEGACY_MAX_SIZE	65536
 #define TSO_MAX_SIZE		UINT_MAX
@@ -3185,8 +3210,10 @@ static inline bool dev_has_header(const struct net_device *dev)
 /*
  * Incoming packets are placed on per-CPU queues
  */
-struct softnet_data {
-	struct list_head	poll_list;
+struct softnet_data {	/* per-cpu结构, 软中断接收函数net_rx_action()会获取本CPU的结构来收包 */
+	struct list_head	poll_list;		/* napi_struct链表, 由napi_schedule()加入
+							 * 软中断接收函数net_rx_action()中遍历所有napi_struct收包
+							 */
 	struct sk_buff_head	process_queue;
 
 	/* stats */
@@ -3196,7 +3223,7 @@ struct softnet_data {
 	struct softnet_data	*rps_ipi_list;
 #endif
 
-	bool			in_net_rx_action;
+	bool			in_net_rx_action;	/* 当前正处于软中断收包流程net_rx_action() */
 	bool			in_napi_threaded_poll;
 
 #ifdef CONFIG_NET_FLOW_LIMIT

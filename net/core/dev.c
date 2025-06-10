@@ -4458,6 +4458,7 @@ int dev_rx_weight __read_mostly = 64;
 int dev_tx_weight __read_mostly = 64;
 
 /* Called with irq disabled */
+/* 将napi_struct加入softnet_data->poll_list中, 并且触发收包的软中断 */
 static inline void ____napi_schedule(struct softnet_data *sd,
 				     struct napi_struct *napi)
 {
@@ -4486,11 +4487,13 @@ static inline void ____napi_schedule(struct softnet_data *sd,
 		}
 	}
 
+ 	/* 将napi_struct加入softnet_data中, 软中断net_rx_action()中就可以收包 */
 	list_add_tail(&napi->poll_list, &sd->poll_list);
 	WRITE_ONCE(napi->list_owner, smp_processor_id());
 	/* If not called from net_rx_action()
 	 * we have to raise NET_RX_SOFTIRQ.
 	 */
+	/* 如果当前CPU没有触发软中断收包, 则触发软中断收包 */
 	if (!sd->in_net_rx_action)
 		__raise_softirq_irqoff(NET_RX_SOFTIRQ);
 }
@@ -6051,14 +6054,17 @@ EXPORT_SYMBOL(__napi_schedule);
  * insure only one NAPI poll instance runs.  We also make
  * sure there is no pending NAPI disable.
  */
+/* 设置napi_struct->state的NAPI_STATE_SCHED标志
+ * 如果原来没有设置则返回true
+ */
 bool napi_schedule_prep(struct napi_struct *n)
 {
 	unsigned long new, val = READ_ONCE(n->state);
 
 	do {
-		if (unlikely(val & NAPIF_STATE_DISABLE))
+		if (unlikely(val & NAPIF_STATE_DISABLE)) /* 禁止调度 */
 			return false;
-		new = val | NAPIF_STATE_SCHED;
+		new = val | NAPIF_STATE_SCHED; /* 设置NAPI_STATE_SCHED标志 */
 
 		/* Sets STATE_MISSED bit if STATE_SCHED was already set
 		 * This was suggested by Alexander Duyck, as compiler
@@ -6066,11 +6072,12 @@ bool napi_schedule_prep(struct napi_struct *n)
 		 * if (val & NAPIF_STATE_SCHED)
 		 *     new |= NAPIF_STATE_MISSED;
 		 */
+		/* 如果已经有NAPI_STATE_SCHED标志, 则设置NAPI_STATE_MISSED */
 		new |= (val & NAPIF_STATE_SCHED) / NAPIF_STATE_SCHED *
 						   NAPIF_STATE_MISSED;
 	} while (!try_cmpxchg(&n->state, &val, new));
 
-	return !(val & NAPIF_STATE_SCHED);
+	return !(val & NAPIF_STATE_SCHED); /* 原来没有设置NAPI_STATE_SCHED标志 */
 }
 EXPORT_SYMBOL(napi_schedule_prep);
 
@@ -6119,6 +6126,7 @@ bool napi_complete_done(struct napi_struct *n, int work_done)
 		if (timeout)
 			ret = false;
 	}
+	/* napi_struct->gro_hash中有GRO缓存接收的包, 提交给协议栈 */
 	if (n->gro_bitmask) {
 		/* When the NAPI instance uses a timeout and keeps postponing
 		 * it, we need to bound somehow the time packets are kept in
@@ -6137,6 +6145,9 @@ bool napi_complete_done(struct napi_struct *n, int work_done)
 	}
 	WRITE_ONCE(n->list_owner, -1);
 
+	/* 这里收包完成了, 去除NAPIF_STATE_SCHED标志
+	 * 该标志在napi_schedule()->napi_schedule_prep()中设置
+	 */
 	val = READ_ONCE(n->state);
 	do {
 		WARN_ON_ONCE(!(val & NAPIF_STATE_SCHED));
@@ -6161,7 +6172,7 @@ bool napi_complete_done(struct napi_struct *n, int work_done)
 	if (timeout)
 		hrtimer_start(&n->timer, ns_to_ktime(timeout),
 			      HRTIMER_MODE_REL_PINNED);
-	return ret;
+	return ret; /* 返回是否需要打开中断 */
 }
 EXPORT_SYMBOL(napi_complete_done);
 
@@ -6547,7 +6558,7 @@ static int __napi_poll(struct napi_struct *n, bool *repoll)
 {
 	int work, weight;
 
-	weight = n->weight;
+	weight = n->weight; /* napi_struct单次收包个数限制 */
 
 	/* This NAPI_STATE_SCHED test is for avoiding a race
 	 * with netpoll's poll_napi().  Only the entity which
@@ -6557,6 +6568,9 @@ static int __napi_poll(struct napi_struct *n, bool *repoll)
 	 */
 	work = 0;
 	if (test_bit(NAPI_STATE_SCHED, &n->state)) {
+ 		/* 这里调用网卡驱动的poll接收数据包, 比如igb_poll()
+		 * 返回work为接收的包个数
+		 */
 		work = n->poll(n, weight);
 		trace_napi_poll(n, work, weight);
 	}
@@ -6565,6 +6579,7 @@ static int __napi_poll(struct napi_struct *n, bool *repoll)
 		netdev_err_once(n->dev, "NAPI poll function %pS returned %d, exceeding its budget of %d.\n",
 				n->poll, work, weight);
 
+	/* weight还有剩余说明收完数据包了, 返回个数 */
 	if (likely(work < weight))
 		return work;
 
@@ -6591,6 +6606,7 @@ static int __napi_poll(struct napi_struct *n, bool *repoll)
 		return work;
 	}
 
+	/* napi_struct->gro_hash中有GRO缓存接收的包, 先将旧的skb(非本jiffies接收的)提交给协议栈 */
 	if (n->gro_bitmask) {
 		/* flush too old packets
 		 * If HZ < 1000, flush all packets.
@@ -6609,7 +6625,7 @@ static int __napi_poll(struct napi_struct *n, bool *repoll)
 		return work;
 	}
 
-	*repoll = true;
+	*repoll = true; /* 还有数据包, 设置repoll */
 
 	return work;
 }
@@ -6620,12 +6636,14 @@ static int napi_poll(struct napi_struct *n, struct list_head *repoll)
 	void *have;
 	int work;
 
-	list_del_init(&n->poll_list);
+	list_del_init(&n->poll_list); /* 从队列中删除 */
 
 	have = netpoll_poll_lock(n);
 
+	/* 调用poll接收数据包, 返回接收的个数. 如果还有未接收的则会设置do_repoll */
 	work = __napi_poll(n, &do_repoll);
 
+	/* 还没接收完, 将napi_struct加入repoll队列 */
 	if (do_repoll)
 		list_add_tail(&n->poll_list, repoll);
 
@@ -6720,22 +6738,29 @@ static int napi_threaded_poll(void *data)
 	return 0;
 }
 
+/* 软中断收包函数: 遍历本CPU的softnet_data->poll_list中的napi_struct来收包 */
 static __latent_entropy void net_rx_action(struct softirq_action *h)
 {
 	struct softnet_data *sd = this_cpu_ptr(&softnet_data);
 	unsigned long time_limit = jiffies +
-		usecs_to_jiffies(READ_ONCE(netdev_budget_usecs));
-	int budget = READ_ONCE(netdev_budget);
+		usecs_to_jiffies(READ_ONCE(netdev_budget_usecs)); /* 默认2个jiffies */
+	int budget = READ_ONCE(netdev_budget); /* 默认300 */
 	LIST_HEAD(list);
 	LIST_HEAD(repoll);
 
 start:
 	sd->in_net_rx_action = true;
+
+
+	/* 这里关中断将sd->poll_list整个队列移动到临时队列list
+	 * 然后开中断, 这样在后面遍历napi_struct收包时如果有中断触发
+	 * napi_schedule()可以继续将napi_struct加入到poll_list中
+	 */
 	local_irq_disable();
 	list_splice_init(&sd->poll_list, &list);
 	local_irq_enable();
 
-	for (;;) {
+	for (;;) { /* 遍历所有加入到poll_list的napi_struct来收包 */
 		struct napi_struct *n;
 
 		skb_defer_free_flush(sd);
@@ -6753,16 +6778,21 @@ start:
 				if (!sd_has_rps_ipi_waiting(sd))
 					goto end;
 			}
-			break;
+			break; /* 接收完了, 退出 */
 		}
 
 		n = list_first_entry(&list, struct napi_struct, poll_list);
+		/* 调用poll接收数据包, 返回接收的个数.
+		 * napi_struct会从list中删除,
+		 * 如果还没接收完(超过napi_struct->weight), 则会将napi_struct加入repoll队列
+		 */
 		budget -= napi_poll(n, &repoll);
 
 		/* If softirq window is exhausted then punt.
 		 * Allow this to run for 2 jiffies since which will allow
 		 * an average latency of 1.5/HZ.
 		 */
+		/* 这里限制每次软中断收包最多300个包或者持续最长2个jiffies */
 		if (unlikely(budget <= 0 ||
 			     time_after_eq(jiffies, time_limit))) {
 			sd->time_squeeze++;
@@ -6770,11 +6800,16 @@ start:
 		}
 	}
 
-	local_irq_disable();
+	local_irq_disable(); /* 以下操作sd->poll_list需关中断 */
 
+	/* 这里按照 list -> sd->poll_list -> repoll 的顺序将这3个队列重新加到sd->poll_list中
+	 * 因为list队列是还没收包的, 下次软中断应该最先处理,
+	 * repoll是已经收包但还有包的, 下次软中断最后处理
+	 */
 	list_splice_tail_init(&sd->poll_list, &list);
 	list_splice_tail(&repoll, &list);
 	list_splice(&list, &sd->poll_list);
+	/* 如果poll_list非空, 则需要触发收包软中断继续接收 */
 	if (!list_empty(&sd->poll_list))
 		__raise_softirq_irqoff(NET_RX_SOFTIRQ);
 	else
