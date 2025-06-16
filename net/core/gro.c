@@ -296,6 +296,9 @@ static void __napi_gro_flush_chain(struct napi_struct *napi, u32 index,
  * youngest packets at the head of it.
  * Complete skbs in reverse order to reduce latencies.
  */
+/* 将gro缓存的包提交给协议栈
+ * flush_old表示只处理旧的包(不是本个jiffies被接收的)
+ */
 void napi_gro_flush(struct napi_struct *napi, bool flush_old)
 {
 	unsigned long bitmask = napi->gro_bitmask;

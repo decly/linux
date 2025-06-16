@@ -383,9 +383,9 @@ struct napi_struct { /* 每个napi_struct对应一个网卡队列 */
 	struct sk_buff		*skb;
 	struct list_head	rx_list; /* Pending GRO_NORMAL skbs */
 					/* 所有napi要提交给协议栈的skb都会缓存在这,
-					 * 然后由gro_normal_one()统一批量提交
+					 * 然后由gro_normal_one()/ gro_normal_list() 统一批量提交
 					 */
-	int			rx_count; /* length of rx_list */
+	int			rx_count; /* length of rx_list *//* rx_list中包的总数, 是总的segs而不是skb的个数 */
 	unsigned int		napi_id;
 	struct hrtimer		timer;
 	struct task_struct	*thread;

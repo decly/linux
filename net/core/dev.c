@@ -6100,6 +6100,10 @@ void __napi_schedule_irqoff(struct napi_struct *n)
 }
 EXPORT_SYMBOL(__napi_schedule_irqoff);
 
+/* 网卡驱动在清空收包队列并且即将打开网卡中断的时候, 会调用napi_complete_done()或napi_complete()
+ * @work_done为驱动poll函数收包的个数
+ * 返回值为true表示网卡驱动需要打开中断, false表示不需要打开中断
+ */
 bool napi_complete_done(struct napi_struct *n, int work_done)
 {
 	unsigned long flags, val, new, timeout = 0;
@@ -6111,20 +6115,46 @@ bool napi_complete_done(struct napi_struct *n, int work_done)
 	 * 2) If we are busy polling, do nothing here, we have
 	 *    the guarantee we will be called later.
 	 */
+	/* 处于busy poll时直接退出且保持关中断 */
 	if (unlikely(n->state & (NAPIF_STATE_NPSVC |
 				 NAPIF_STATE_IN_BUSY_POLL)))
-		return false;
+		return false; /* 保持关中断 */
 
 	if (work_done) {
+		/* gro_flush_timeout参数配置(/sys/class/net/ethX/gro_flush_timeout)
+		 * 用来延迟GRO向协议栈提交数据包的时间, 增加GRO聚合(默认不配置, 单位纳秒)
+		 *
+		 * 原理是: 如果GRO的gro_hash中有数据包, 先不将当前jiffies接收的数据包提交给
+		 * 协议栈, 通过设置超时时间为gro_flush_timeout的定时器, 如果没有继续收到
+		 * 数据包则等定时器超时再提交给协议栈.
+		 *
+		 * 如果配置了, 当前有收包(work_done)并且gro有缓存数据包(gro_bitmask),
+		 * 则
+		 * - GRO只会向协议栈提交非本jiffies接收的包(详见下面调用napi_gro_flush的
+		 *   flush_old参数), 新接收的包先缓存等GRO尝试继续聚合
+		 * - 启动定时器(下面的hrtimer_start), 超时时间为gro_flush_timeout, 超时后调用
+		 *   napi_watchdog() -> __napi_schedule_irqoff() -> ____napi_schedule()
+		 *   重新让软中断来接收数据包, 然后会再次进入本函数处理gro_hash中缓存的包
+		 */
 		if (n->gro_bitmask)
 			timeout = READ_ONCE(n->dev->gro_flush_timeout);
 		n->defer_hard_irqs_count = READ_ONCE(n->dev->napi_defer_hard_irqs);
 	}
+	/* napi_defer_hard_irqs参数配置(/sys/class/net/ethX/napi_defer_hard_irqs)
+	 * 通过减少开关中断的次数来减少中断开销. 需配合gro_flush_timeout参数使用.
+	 * 配置值表示每次收到数据包后要屏蔽中断的次数, 默认不配置.
+	 * 
+	 * 原理是: 网卡驱动在每次收完数据包后都会调用本函数(napi_complete_done),
+	 * 返回true时网卡驱动会打开中断然后等待新的数据包到来再关中断进行新一轮的NAPI接收,
+	 * 当配置了napi_defer_hard_irqs参数后, 通过修改本函数的返回值为false来通知网卡驱动
+	 * 继续保持关中断, 期间gro_flush_timeout参数配置的定时器会在超时后会继续在软中断收包.
+	 * 在经过defer_hard_irqs_count次数后恢复开中断.
+	 */
 	if (n->defer_hard_irqs_count > 0) {
 		n->defer_hard_irqs_count--;
 		timeout = READ_ONCE(n->dev->gro_flush_timeout);
 		if (timeout)
-			ret = false;
+			ret = false; /* 返回false让驱动保持关中断 */
 	}
 	/* napi_struct->gro_hash中有GRO缓存接收的包, 提交给协议栈 */
 	if (n->gro_bitmask) {
@@ -6132,9 +6162,11 @@ bool napi_complete_done(struct napi_struct *n, int work_done)
 		 * it, we need to bound somehow the time packets are kept in
 		 * the GRO layer
 		 */
+		/* timeout有值则只处理旧的包(不是本个jiffies被接收的) */
 		napi_gro_flush(n, !!timeout);
 	}
 
+	/* 将napi->rx_list中的skb全部提交给协议栈 */
 	gro_normal_list(n);
 
 	if (unlikely(!list_empty(&n->poll_list))) {
@@ -6169,6 +6201,7 @@ bool napi_complete_done(struct napi_struct *n, int work_done)
 		return false;
 	}
 
+	/* 定时器回调函数为napi_watchdog() */
 	if (timeout)
 		hrtimer_start(&n->timer, ns_to_ktime(timeout),
 			      HRTIMER_MODE_REL_PINNED);
@@ -6291,6 +6324,7 @@ restart:
 					set_bit(NAPI_STATE_PREFER_BUSY_POLL, &napi->state);
 				goto count;
 			}
+			/* 设置NAPIF_STATE_IN_BUSY_POLL和NAPIF_STATE_SCHED标志 */
 			if (cmpxchg(&napi->state, val,
 				    val | NAPIF_STATE_IN_BUSY_POLL |
 					  NAPIF_STATE_SCHED) != val) {
@@ -6301,7 +6335,7 @@ restart:
 			have_poll_lock = netpoll_poll_lock(napi);
 			napi_poll = napi->poll;
 		}
-		work = napi_poll(napi, budget);
+		work = napi_poll(napi, budget); /* 调用poll接收数据包 */
 		trace_napi_poll(napi, work, budget);
 		gro_normal_list(napi);
 count:
@@ -6310,6 +6344,7 @@ count:
 					LINUX_MIB_BUSYPOLLRXPACKETS, work);
 		local_bh_enable();
 
+		/* 调用ep_busy_loop_end, 判断有事件触发或者超时退出循环 */
 		if (!loop_end || loop_end(loop_end_arg, start_time))
 			break;
 

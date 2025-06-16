@@ -432,7 +432,7 @@ static inline __wsum ip6_gro_compute_pseudo(struct sk_buff *skb, int proto)
 int skb_gro_receive(struct sk_buff *p, struct sk_buff *skb);
 
 /* Pass the currently batched GRO_NORMAL SKBs up to the stack. */
-/* 将napi->rx_list中的skb提交给上层协议 */
+/* 将napi->rx_list中的skb提交给协议栈 */
 static inline void gro_normal_list(struct napi_struct *napi)
 {
 	if (!napi->rx_count)

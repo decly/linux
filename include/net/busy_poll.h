@@ -32,6 +32,7 @@ struct napi_struct;
 extern unsigned int sysctl_net_busy_read __read_mostly;
 extern unsigned int sysctl_net_busy_poll __read_mostly;
 
+/* 全局开启了busy_poll */
 static inline bool net_busy_loop_on(void)
 {
 	return READ_ONCE(sysctl_net_busy_poll);
